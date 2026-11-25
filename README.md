@@ -58,7 +58,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `c` | whole file / changes only |
 | `<` / `>` | old side alone / new side alone, full width; the same key again shows both |
 | `g` / `G` | top / end |
-| mouse drag | select text on one side and copy it (OSC 52; also `pbcopy` on a local Mac) |
+| mouse drag | select text on one side and copy it (OSC 52; also `pbcopy` on a local Mac); a file title copies its full path |
 | `y` / `Esc` | copy the selection again / clear it |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |

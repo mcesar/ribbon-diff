@@ -393,7 +393,7 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
         let at = shown.get(row as usize).copied().unwrap_or(usize::MAX);
         match rows.get(at) {
             None | Some(Row::Gap) => clear(buf, row_area, theme.base()),
-            Some(&Row::Header(index)) => draw_file_title(buf, row_area, app, index, old_side),
+            Some(&Row::Header(index)) => draw_file_title(buf, row_area, app, index, old_side, app.is_selected(old_side, at)),
             Some(Row::Fold(hidden)) => {
                 let style = theme.base().fg(theme.muted()).add_modifier(Modifier::ITALIC);
                 clear(buf, row_area, style);
@@ -463,15 +463,19 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
 }
 
 /// One side of a file's title row: its path and its line count on that side.
-fn draw_file_title(buf: &mut Buffer, area: Rect, app: &App, index: usize, old_side: bool) {
+/// A selected title shows its path reversed; copying it copies the whole path.
+fn draw_file_title(buf: &mut Buffer, area: Rect, app: &App, index: usize, old_side: bool, selected: bool) {
     let theme = &app.theme;
     let file = &app.files[index];
     clear(buf, area, theme.panel());
     let name = if old_side { &file.diff.old_name } else { &file.diff.new_name };
     let counts = if old_side { format!("-{}", file.removed) } else { format!("+{}", file.added) };
     let room = area.width.saturating_sub(counts.len() as u16 + 3) as usize;
+    let path_style = if selected { theme.file_title().add_modifier(Modifier::REVERSED) } else { theme.file_title() };
     let spans = vec![
-        Span::styled(format!(" {} ", fit_path(name, room)), theme.file_title()),
+        Span::raw(" "),
+        Span::styled(fit_path(name, room), path_style),
+        Span::raw(" "),
         Span::styled(counts, theme.panel().fg(theme.change_color(old_side))),
     ];
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
@@ -711,6 +715,25 @@ struct App {
 impl App {
     fn numbers_right(&self, old_side: bool) -> bool {
         old_side && self.panes == Panes::Both
+    }
+
+    /// The file whose title is pinned over the first row, if any.
+    fn sticky_file(&self) -> Option<usize> {
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        match self.panes {
+            Panes::New => self.stream.sticky_file(right_top, false),
+            _ => self.stream.sticky_file(left_top, true),
+        }
+    }
+
+    /// The stream row of a file's title on one side.
+    fn header_row(&self, file: usize, old_side: bool) -> usize {
+        let rows = if old_side { &self.stream.left } else { &self.stream.right };
+        rows.iter().position(|r| *r == Row::Header(file)).unwrap_or(0)
+    }
+
+    fn is_selected(&self, old_side: bool, row: usize) -> bool {
+        self.selection.is_some_and(|s| s.old_side == old_side && s.columns(row).is_some())
     }
 
     /// Stream rows drawn on one side, from `top`. A side alone drops the blank rows that keep
@@ -1023,6 +1046,10 @@ impl App {
         let top = if old_side { left_top } else { right_top };
         let row = y.saturating_sub(area.y).min(area.height.saturating_sub(1)) as usize;
         let column = x.saturating_sub(code_x).min(code_width.saturating_sub(1)) as usize;
+        // The pinned title stands for the file's own title row.
+        if let (0, Some(file)) = (row, self.sticky_file()) {
+            return (self.header_row(file, old_side), column + self.hscroll);
+        }
         let shown = self.shown_rows(old_side, top, row + 1);
         (shown.get(row).or(shown.last()).copied().unwrap_or(top), column + self.hscroll)
     }
@@ -1070,17 +1097,25 @@ impl App {
     }
 
     /// The selected source text, one line per selected source row, and the line count.
-    /// Folds and headers are skipped.
+    /// A file title gives its whole path; folds and blank rows are skipped.
     fn selected_text(&self, selection: &Selection) -> (String, usize) {
         let rows = if selection.old_side { &self.stream.left } else { &self.stream.right };
         let (start, end) = selection.bounds();
         let mut lines = Vec::new();
         for row in start.0..=end.0 {
-            let Some(&Row::Line(file, index)) = rows.get(row) else { continue };
-            let model = &self.files[file].diff.model;
-            let line = if selection.old_side { &model.old[index] } else { &model.new[index] };
-            let (from, to) = selection.columns(row).unwrap_or((0, 0));
-            lines.push(select::slice_columns(line, from, to));
+            match rows.get(row) {
+                Some(&Row::Line(file, index)) => {
+                    let model = &self.files[file].diff.model;
+                    let line = if selection.old_side { &model.old[index] } else { &model.new[index] };
+                    let (from, to) = selection.columns(row).unwrap_or((0, 0));
+                    lines.push(select::slice_columns(line, from, to));
+                }
+                Some(&Row::Header(file)) => {
+                    let diff = &self.files[file].diff;
+                    lines.push(if selection.old_side { &diff.old_name } else { &diff.new_name });
+                }
+                _ => {}
+            }
         }
         (lines.join("\n"), lines.len())
     }
@@ -1246,13 +1281,11 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
             draw_side(buf, parts.left, left_top, &app, true);
             draw_side(buf, parts.right, right_top, &app, false);
             // Pin the current file's title over the first row, like a pull request page.
-            let sticky = match app.panes {
-                Panes::New => app.stream.sticky_file(right_top, false),
-                _ => app.stream.sticky_file(left_top, true),
-            };
-            if let Some(sticky) = sticky {
-                draw_file_title(buf, Rect { height: 1, ..parts.left }, &app, sticky, true);
-                draw_file_title(buf, Rect { height: 1, ..parts.right }, &app, sticky, false);
+            if let Some(sticky) = app.sticky_file() {
+                for (area, old_side) in [(parts.left, true), (parts.right, false)] {
+                    let selected = app.is_selected(old_side, app.header_row(sticky, old_side));
+                    draw_file_title(buf, Rect { height: 1, ..area }, &app, sticky, old_side, selected);
+                }
             }
             draw_gutter(buf, parts.gutter, &app.stream.blocks, view, graphics, &app.theme);
             draw_status(buf, parts.status, &app, file);
