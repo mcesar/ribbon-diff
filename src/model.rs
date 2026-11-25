@@ -414,10 +414,23 @@ impl ScrollMap {
     /// Scroll position that puts a row of the old side at the top. Meant for rows outside changes
     /// (file headers), where both sides move together.
     pub fn position_of_left_row(&self, row: usize) -> usize {
+        self.position_of_row(row, true)
+    }
+
+    /// Scroll position that puts a row of one side at the top, or about there inside a change.
+    pub fn position_of_row(&self, row: usize, old_side: bool) -> usize {
+        let range = |s: &Segment| if old_side { (s.a0, s.la) } else { (s.b0, s.lb) };
         self.segments
             .iter()
-            .find(|s| row >= s.a0 && row < s.a0 + s.la)
-            .map_or(self.total, |s| s.start + (row - s.a0) * s.len / s.la)
+            .find(|s| {
+                let (first, count) = range(s);
+                row >= first && row < first + count
+            })
+            .map_or(self.total, |s| {
+                let (first, count) = range(s);
+                // Rounded up, so `tops` at this position gives back this row.
+                s.start + ((row - first) * s.len).div_ceil(count)
+            })
     }
 
     /// Scroll position where the scroll block starting at old row `a0` and new row `b0` begins.
@@ -588,5 +601,18 @@ mod tests {
         let (old, new) = inline_changes("let total = price * qty;", "let total = cost * qty;");
         assert_eq!(&"let total = price * qty;"[old[0].clone()], "price");
         assert_eq!(&"let total = cost * qty;"[new[0].clone()], "cost");
+    }
+
+    #[test]
+    fn position_of_row_shows_that_row_on_its_side() {
+        // A change of 3 old lines against 10 new lines, between unchanged lines.
+        let blocks = [Block { a0: 5, a1: 8, b0: 5, b1: 15 }];
+        let scroll = ScrollMap::new(&blocks, 20, 27);
+        for row in 0..20 {
+            assert_eq!(scroll.tops(scroll.position_of_row(row, true)).0, row, "old row {row}");
+        }
+        for row in 0..27 {
+            assert_eq!(scroll.tops(scroll.position_of_row(row, false)).1, row, "new row {row}");
+        }
     }
 }

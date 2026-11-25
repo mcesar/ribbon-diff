@@ -52,14 +52,20 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `d` / `u` | half page down / up |
 | `n` / `N` | next / previous change (continues into the next / previous file) |
 | `]` / `[` | next / previous file |
+| `/` | search both sides as you type (lowercase ignores case); `Enter` keeps it, `Esc` cancels |
+| `n` / `N` after a search | next / previous match; `Esc` clears the search |
 | `f`, `Tab` | file list |
 | `c` | whole file / changes only |
+| `<` / `>` | old side alone / new side alone, full width; the same key again shows both |
 | `g` / `G` | top / end |
+| mouse drag | select text on one side and copy it (OSC 52; also `pbcopy` on a local Mac) |
+| `y` / `Esc` | copy the selection again / clear it |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |
 
 ## Options
 
+- `--untracked`: also show untracked files (not ignored) as new files, when the diff compares with the working tree (not with `--cached` or two commits). Pathspecs apply to them too.
 - `-U, --context N`: unchanged lines shown around each change (default 3).
 - `--graphics auto|kitty|blocks`: how to draw ribbons.
 - `--theme NAME`: syntect theme (default `base16-ocean.dark`).

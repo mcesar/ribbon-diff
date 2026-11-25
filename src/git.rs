@@ -128,6 +128,55 @@ pub fn changes(args: &[String]) -> anyhow::Result<Vec<Change>> {
         .collect())
 }
 
+fn is_commit(arg: &str) -> bool {
+    git(&["rev-parse", "--verify", "--quiet", &format!("{arg}^{{commit}}")]).is_ok()
+}
+
+/// What `git diff <args>` compares: true when the new side is the working tree, and the
+/// pathspecs, given after `--` or, as git allows, without it.
+fn worktree_and_pathspecs(args: &[String]) -> (bool, Vec<String>) {
+    let dash = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let (mut revisions, mut pathspecs) = (0, Vec::new());
+    let mut index_only = false;
+    for arg in &args[..dash] {
+        if arg == "--cached" || arg == "--staged" {
+            index_only = true;
+        } else if arg.starts_with('-') {
+            continue;
+        } else if arg.contains("..") {
+            revisions += 2;
+        } else if is_commit(arg) {
+            revisions += 1;
+        } else {
+            pathspecs.push(arg.clone());
+        }
+    }
+    pathspecs.extend(args.iter().skip(dash + 1).cloned());
+    (!index_only && revisions <= 1, pathspecs)
+}
+
+/// Untracked files that are not ignored, as new files, for a `git diff <args>` that compares
+/// with the working tree. Other comparisons get none. The same pathspecs apply.
+pub fn untracked(args: &[String]) -> anyhow::Result<Vec<Change>> {
+    let (worktree, pathspecs) = worktree_and_pathspecs(args);
+    if !worktree {
+        return Ok(Vec::new());
+    }
+    let root = PathBuf::from(String::from_utf8_lossy(&git(&["rev-parse", "--show-toplevel"])?).trim());
+    // --full-name gives paths from the top of the repository, like `git diff --raw`.
+    let mut command = vec!["-c", "core.quotepath=false", "ls-files", "-z", "--others", "--exclude-standard", "--full-name", "--"];
+    command.extend(pathspecs.iter().map(String::as_str));
+    let listed = git(&command)?;
+    Ok(String::from_utf8_lossy(&listed)
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| {
+            let new = std::fs::read(root.join(name)).ok()?;
+            Some(Change { old_name: name.to_owned(), new_name: name.to_owned(), old: Vec::new(), new })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

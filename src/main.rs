@@ -12,6 +12,8 @@ mod git;
 mod gutter;
 mod highlight;
 mod model;
+mod search;
+mod select;
 mod termcolors;
 mod ui;
 
@@ -45,6 +47,8 @@ OPTIONS:
     -w, --ignore-all-space      compare lines without their whitespace
     --ignore-comments           compare lines without their comments; changes to comments or
                                 blank lines alone are not highlighted or counted
+    --untracked                 also show untracked files (not ignored) as new files, when
+                                comparing with the working tree
     -U, --context N             unchanged lines shown around each change (default: 3)
     --theme NAME                terminal (default: the terminal's own colors), or a syntect theme
     --graphics auto|kitty|blocks
@@ -59,12 +63,15 @@ KEYS:
     n/N                 next/prev change         ]/[      next/prev file
     f, Tab              file list                c        whole file / changes only
     g/G                 top/end                  q        quit
+    < / >               old side / new side alone (again: both)
+    /                   search (then n/N)        drag, y  select and copy
 ";
 
 struct Options {
     name: Option<String>,
     ignore_whitespace: bool,
     ignore_comments: bool,
+    untracked: bool,
     graphics: Option<Graphics>,
     theme: String,
     context: usize,
@@ -76,6 +83,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         name: None,
         ignore_whitespace: false,
         ignore_comments: false,
+        untracked: false,
         graphics: None,
         theme: highlight::DEFAULT_THEME.into(),
         context: 3,
@@ -92,6 +100,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         match arg.as_str() {
             "-w" | "--ignore-all-space" => options.ignore_whitespace = true,
             "--ignore-comments" => options.ignore_comments = true,
+            "--untracked" => options.untracked = true,
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(None);
@@ -241,10 +250,14 @@ fn read_pairs(options: &Options) -> anyhow::Result<Vec<Pair>> {
             let name = |path: &String| options.name.clone().unwrap_or_else(|| path.clone());
             vec![Pair { old_name: name(&p[0]), new_name: name(&p[1]), old: read(&p[0])?, new: read(&p[1])? }]
         }
-        Source::Git => git::changes(p)?
-            .into_iter()
-            .map(|c| Pair { old_name: c.old_name, new_name: c.new_name, old: c.old, new: c.new })
-            .collect(),
+        Source::Git => {
+            let mut changes = git::changes(p)?;
+            if options.untracked {
+                changes.extend(git::untracked(p)?);
+                changes.sort_by(|a, b| a.new_name.cmp(&b.new_name));
+            }
+            changes.into_iter().map(|c| Pair { old_name: c.old_name, new_name: c.new_name, old: c.old, new: c.new }).collect()
+        }
     })
 }
 
