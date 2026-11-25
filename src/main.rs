@@ -27,7 +27,8 @@ use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use ui::{FileDiff, Graphics, Outcome, Settings};
 
 const HELP: &str = "\
@@ -53,6 +54,8 @@ OPTIONS:
                                 comparing with the working tree
     --ignore-imports            compare lines without import statements; changes to imports
                                 alone are not highlighted or counted
+    --watch[=INTERVAL]          reload when the files change (git and two-path modes); checks
+                                every second, or every INTERVAL such as 500ms or 2s
     -U, --context N             unchanged lines shown around each change (default: 3)
     --theme NAME                terminal (default: the terminal's own colors), or a syntect theme
     --graphics auto|kitty|blocks
@@ -71,12 +74,14 @@ KEYS:
     /                   search (then n/N)        drag, y  select and copy
 ";
 
+#[derive(Clone)]
 struct Options {
     name: Option<String>,
     ignore_whitespace: bool,
     ignore_comments: bool,
     ignore_imports: bool,
     untracked: bool,
+    watch: Option<Duration>,
     graphics: Option<Graphics>,
     theme: String,
     context: usize,
@@ -90,6 +95,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         ignore_comments: false,
         ignore_imports: false,
         untracked: false,
+        watch: None,
         graphics: None,
         theme: highlight::DEFAULT_THEME.into(),
         context: 3,
@@ -108,6 +114,8 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
             "--ignore-comments" => options.ignore_comments = true,
             "--ignore-imports" => options.ignore_imports = true,
             "--untracked" => options.untracked = true,
+            "--watch" => options.watch = Some(Duration::from_secs(1)),
+            _ if arg.starts_with("--watch=") => options.watch = Some(parse_interval(&arg["--watch=".len()..])?),
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(None);
@@ -133,6 +141,16 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         }
     }
     Ok(Some(options))
+}
+
+/// `500ms`, `2s`, or a number of seconds.
+fn parse_interval(text: &str) -> anyhow::Result<Duration> {
+    let (number, scale) = match text.strip_suffix("ms") {
+        Some(ms) => (ms, 0.001),
+        None => (text.strip_suffix('s').unwrap_or(text), 1.0),
+    };
+    let seconds = number.parse::<f64>().ok().filter(|n| *n > 0.0).with_context(|| format!("--watch needs an interval like 500ms or 2s, not {text:?}"))?;
+    Ok(Duration::from_secs_f64((seconds * scale).max(0.05)))
 }
 
 fn detect_graphics() -> Graphics {
@@ -300,36 +318,109 @@ fn model_for(pair: &Pair, options: &Options, highlighter: &Highlighter) -> Model
     Model::from_lines(old, new, Some((old_keys, new_keys)))
 }
 
-fn run() -> anyhow::Result<ExitCode> {
-    let Some(options) = parse_args()? else {
-        return Ok(ExitCode::SUCCESS);
-    };
+/// Read the changed files and diff them. `report` prints renames and binary files, which only
+/// the first load does: later loads happen while the viewer is on screen.
+fn load(options: &Options, highlighter: &Highlighter, report: bool) -> anyhow::Result<Vec<(Pair, Model)>> {
     // Read both sides now: git deletes its temporary files when this process exits.
-    let pairs = read_pairs(&options)?;
+    let pairs = read_pairs(options)?;
 
     let mut text_pairs = Vec::new();
     for pair in pairs {
         if pair.old == pair.new {
-            if pair.old_name != pair.new_name {
+            if pair.old_name != pair.new_name && report {
                 println!("renamed {} -> {}", pair.old_name, pair.new_name);
             }
         } else if is_binary(&pair.old) || is_binary(&pair.new) {
-            println!("Binary files {} and {} differ", pair.old_name, pair.new_name);
+            if report {
+                println!("Binary files {} and {} differ", pair.old_name, pair.new_name);
+            }
         } else {
             text_pairs.push(pair);
         }
     }
 
-    let highlighter = Arc::new(Highlighter::new(&options.theme)?);
     // Files whose only changes are ignored (whitespace, comments) drop out, as with `git diff -w`.
-    let diffs: Vec<(Pair, Model)> = text_pairs
+    Ok(text_pairs
         .into_iter()
         .map(|pair| {
-            let model = model_for(&pair, &options, &highlighter);
+            let model = model_for(&pair, options, highlighter);
             (pair, model)
         })
         .filter(|(_, model)| !model.blocks.is_empty())
-        .collect();
+        .collect())
+}
+
+fn file_diffs(diffs: Vec<(Pair, Model)>) -> Vec<FileDiff> {
+    diffs.into_iter().map(|(pair, model)| FileDiff { old_name: pair.old_name, new_name: pair.new_name, model }).collect()
+}
+
+/// Something that changes when the files to compare change, for `--watch`. None when the
+/// source can't be watched (git's temporary files in external-diff mode).
+fn signature(options: &Options) -> Option<Vec<u8>> {
+    let p = &options.positional;
+    match source(p) {
+        Source::External => None,
+        Source::Git => git::signature(p, options.untracked).ok(),
+        Source::Paths => {
+            let mut signature = String::new();
+            for root in [Path::new(&p[0]), Path::new(&p[1])] {
+                let files: Vec<std::path::PathBuf> = if root.is_dir() {
+                    walk(root).unwrap_or_default().into_iter().map(|name| root.join(name)).collect()
+                } else {
+                    vec![root.to_path_buf()]
+                };
+                for file in files {
+                    signature.push_str(&format!("{}={}\0", file.display(), git::stamp(&file)));
+                }
+            }
+            Some(signature.into_bytes())
+        }
+    }
+}
+
+/// Check for changes every `interval` and send each new set of changed files to the viewer,
+/// until the viewer is gone.
+fn spawn_watcher(options: Options, highlighter: Arc<Highlighter>, interval: Duration, mut last: Option<Vec<u8>>) -> mpsc::Receiver<Vec<FileDiff>> {
+    let (sender, reloads) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        let now = signature(&options);
+        if now == last {
+            continue;
+        }
+        last = now;
+        // A file caught in the middle of a save can fail to read; the next check tries again.
+        if let Ok(diffs) = load(&options, &highlighter, false) {
+            if sender.send(file_diffs(diffs)).is_err() {
+                return;
+            }
+        }
+    });
+    reloads
+}
+
+fn run() -> anyhow::Result<ExitCode> {
+    let Some(options) = parse_args()? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let highlighter = Arc::new(Highlighter::new(&options.theme)?);
+    let watch = options.watch.filter(|_| std::io::stdout().is_terminal() && !matches!(source(&options.positional), Source::External));
+    // Take the signature before reading, so a change made while reading is not missed.
+    let mut last = watch.and_then(|_| signature(&options));
+    let mut diffs = load(&options, &highlighter, true)?;
+    if diffs.is_empty() {
+        if let Some(interval) = watch {
+            eprintln!("ribbon: no changes; watching for changes (Ctrl-C to stop)");
+            while diffs.is_empty() {
+                std::thread::sleep(interval);
+                let now = signature(&options);
+                if now != last {
+                    last = now;
+                    diffs = load(&options, &highlighter, false).unwrap_or_default();
+                }
+            }
+        }
+    }
     if diffs.is_empty() {
         // Say so on a terminal; git and pipes expect silence for "no changes".
         if std::io::stderr().is_terminal() && !matches!(source(&options.positional), Source::External) {
@@ -354,15 +445,14 @@ fn run() -> anyhow::Result<ExitCode> {
         };
     }
 
-    let files = diffs
-        .into_iter()
-        .map(|(pair, model)| FileDiff { old_name: pair.old_name, new_name: pair.new_name, model })
-        .collect();
+    let reloads = watch.map(|interval| spawn_watcher(options.clone(), Arc::clone(&highlighter), interval, last));
     let settings = Settings {
         graphics: options.graphics.unwrap_or_else(detect_graphics),
         context: options.context,
         highlighter,
+        reloads,
     };
+    let files = file_diffs(diffs);
     Ok(match ui::run(files, settings)? {
         Outcome::Quit => ExitCode::SUCCESS,
         Outcome::QuitAll => ExitCode::from(1),

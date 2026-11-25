@@ -63,6 +63,44 @@ pub struct Settings {
     /// Unchanged lines kept around each change; the `c` key shows the whole file instead.
     pub context: usize,
     pub highlighter: Arc<Highlighter>,
+    /// With `--watch`: a fresh set of changed files whenever they change on disk.
+    pub reloads: Option<mpsc::Receiver<Vec<FileDiff>>>,
+}
+
+/// Color files in stream order on a background thread; each result redraws. Dropping the
+/// receiver stops the thread.
+fn spawn_highlighting(files: &[FileState], highlighter: &Arc<Highlighter>) -> mpsc::Receiver<Highlighted> {
+    let (sender, highlights) = mpsc::channel::<Highlighted>();
+    let jobs: Vec<(usize, String, Vec<String>, Vec<String>)> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.old_tokens.is_empty() || f.new_tokens.is_empty())
+        .map(|(i, f)| (i, f.diff.new_name.clone(), f.diff.model.old.clone(), f.diff.model.new.clone()))
+        .collect();
+    let highlighter = Arc::clone(highlighter);
+    thread::spawn(move || {
+        for (file, name, old, new) in jobs {
+            for (is_old, lines) in [(true, old), (false, new)] {
+                let tokens = highlighter.highlight(&name, &lines);
+                if sender.send(Highlighted { file, is_old, tokens }).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    highlights
+}
+
+/// Columns of the widest line, and the width of the line number column.
+fn measure(files: &[FileState]) -> (usize, u16) {
+    let max_width = files
+        .iter()
+        .flat_map(|f| f.diff.model.old.iter().chain(&f.diff.model.new))
+        .map(|line| line.replace('\t', TAB).width())
+        .max()
+        .unwrap_or(0);
+    let max_line = files.iter().map(|f| f.diff.model.old.len().max(f.diff.model.new.len())).max().unwrap_or(1).max(1);
+    (max_width, (max_line.to_string().len() + 1) as u16)
 }
 
 /// Syntax colors for one side of one file, sent by a background thread.
@@ -716,9 +754,81 @@ struct App {
     /// Body rows from the last frame.
     body_rows: usize,
     panes: Panes,
+    /// Counts reloads, so the ribbon image is drawn again for new changes.
+    generation: usize,
 }
 
 impl App {
+    /// Show a new set of changed files (from `--watch`) and stay on the same file and line.
+    /// Files whose text did not change keep their colors. Returns false when nothing is shown
+    /// differently.
+    fn reload(&mut self, diffs: Vec<FileDiff>) -> bool {
+        if diffs.is_empty() {
+            self.notice = Some("no changes now; still watching".into());
+            return false;
+        }
+        // Where the view is: a file, a new-side line near the top (its index and text), and its
+        // screen row.
+        let (_, right_top) = self.stream.scroll.tops(self.position);
+        let anchor = self.stream.right.iter().enumerate().skip(right_top).find_map(|(row, r)| match *r {
+            Row::Line(file, index) => {
+                let diff = &self.files[file].diff;
+                Some((diff.new_name.clone(), Some((index, diff.model.new[index].clone())), row - right_top))
+            }
+            Row::Header(file) => Some((self.files[file].diff.new_name.clone(), None, row - right_top)),
+            _ => None,
+        });
+
+        let mut old_files: Vec<FileState> = std::mem::take(&mut self.files);
+        self.files = diffs
+            .into_iter()
+            .map(|diff| {
+                let mut state = FileState::new(diff);
+                let same = old_files.iter_mut().find(|f| {
+                    f.diff.new_name == state.diff.new_name && f.diff.model.old == state.diff.model.old && f.diff.model.new == state.diff.model.new
+                });
+                if let Some(same) = same {
+                    state.old_tokens = std::mem::take(&mut same.old_tokens);
+                    state.new_tokens = std::mem::take(&mut same.new_tokens);
+                }
+                state
+            })
+            .collect();
+        (self.max_width, self.number_width) = measure(&self.files);
+        self.stream = Stream::new(&self.files, (!self.whole_file).then_some(self.context));
+        self.generation += 1;
+        self.selection = None;
+        self.dragging = false;
+        if let Some(selected) = self.picker {
+            self.picker = Some(selected.min(self.files.len() - 1));
+        }
+
+        self.position = match anchor {
+            Some((name, line, offset)) => match self.files.iter().position(|f| f.diff.new_name == name) {
+                Some(file) => {
+                    // Lines above may have been added or removed: look for the same text nearest
+                    // to the old place. Then the first shown line from there, or the file title.
+                    let new_lines = &self.files[file].diff.model.new;
+                    let line = line.map(|(index, text)| {
+                        new_lines.iter().enumerate().filter(|(_, l)| **l == text).map(|(i, _)| i).min_by_key(|i| i.abs_diff(index)).unwrap_or(index)
+                    });
+                    let row = line
+                        .and_then(|line| self.stream.right.iter().position(|r| matches!(*r, Row::Line(f, i) if f == file && i >= line)))
+                        .unwrap_or_else(|| self.header_row(file, false));
+                    self.stream.scroll.position_of_row(row, false).saturating_sub(offset)
+                }
+                None => self.position,
+            },
+            None => self.position,
+        };
+        if self.search.is_some() {
+            self.update_matches();
+            self.current_from(self.position);
+        }
+        self.notice = Some("reloaded".into());
+        true
+    }
+
     fn numbers_right(&self, old_side: bool) -> bool {
         old_side && self.panes == Panes::Both
     }
@@ -1216,33 +1326,8 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
     let stream = Stream::new(&files, Some(settings.context));
-    let max_line = files.iter().map(|f| f.diff.model.old.len().max(f.diff.model.new.len())).max().unwrap_or(1).max(1);
-
-    // One background thread colors the files in stream order; each result redraws.
-    let (sender, highlights) = mpsc::channel::<Highlighted>();
-    let jobs: Vec<(usize, String, Vec<String>, Vec<String>)> = files
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (i, f.diff.new_name.clone(), f.diff.model.old.clone(), f.diff.model.new.clone()))
-        .collect();
-    let highlighter = Arc::clone(&settings.highlighter);
-    thread::spawn(move || {
-        for (file, name, old, new) in jobs {
-            for (is_old, lines) in [(true, old), (false, new)] {
-                let tokens = highlighter.highlight(&name, &lines);
-                if sender.send(Highlighted { file, is_old, tokens }).is_err() {
-                    return;
-                }
-            }
-        }
-    });
-
-    let max_width = files
-        .iter()
-        .flat_map(|f| f.diff.model.old.iter().chain(&f.diff.model.new))
-        .map(|line| line.replace('\t', TAB).width())
-        .max()
-        .unwrap_or(0);
+    let mut highlights = spawn_highlighting(&files, &settings.highlighter);
+    let (max_width, number_width) = measure(&files);
     let mut app = App {
         position: stream.change_starts().first().copied().unwrap_or(0),
         stream,
@@ -1251,7 +1336,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
         context: settings.context,
         picker: None,
         theme: Theme::new(&settings.highlighter, terminal_colors),
-        number_width: (max_line.to_string().len() + 1) as u16,
+        number_width,
         hscroll: 0,
         max_width,
         code_width: 0,
@@ -1262,9 +1347,10 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
         search: None,
         body_rows: 0,
         panes: Panes::Both,
+        generation: 0,
     };
     let graphics = settings.graphics;
-    let mut last_image: Option<(bool, View)> = None;
+    let mut last_image: Option<(bool, usize, View)> = None;
 
     loop {
         let size = term.size()?;
@@ -1302,7 +1388,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
 
         if graphics == Graphics::Kitty {
             // The picker covers the gutter, so the image comes down while it is open.
-            let wanted = app.picker.is_none().then_some((app.whole_file, view));
+            let wanted = app.picker.is_none().then_some((app.whole_file, app.generation, view));
             if wanted != last_image {
                 let backend = term.backend_mut();
                 match wanted {
@@ -1327,6 +1413,11 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
             } else if let Ok(done) = highlights.try_recv() {
                 let file = &mut app.files[done.file];
                 *(if done.is_old { &mut file.old_tokens } else { &mut file.new_tokens }) = done.tokens;
+                break;
+            } else if let Some(diffs) = settings.reloads.as_ref().and_then(|r| r.try_recv().ok()) {
+                if app.reload(diffs) {
+                    highlights = spawn_highlighting(&app.files, &settings.highlighter);
+                }
                 break;
             }
         }

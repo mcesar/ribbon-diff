@@ -95,13 +95,52 @@ fn read_blobs(ids: Vec<String>) -> anyhow::Result<HashMap<String, Vec<u8>>> {
     Ok(blobs)
 }
 
-/// The changed files for `git diff <args>`, with both versions read into memory.
-pub fn changes(args: &[String]) -> anyhow::Result<Vec<Change>> {
-    let root = PathBuf::from(String::from_utf8_lossy(&git(&["rev-parse", "--show-toplevel"])?).trim());
+/// `git diff --raw` output for the user's arguments.
+fn raw_diff(args: &[String]) -> anyhow::Result<Vec<u8>> {
     // Our format options come first so the user's pathspecs, after "--", stay last.
     let mut command = vec!["-c", "core.quotepath=false", "diff", "--raw", "-z", "--no-abbrev", "-M", "--no-ext-diff", "--no-textconv", "--no-color"];
     command.extend(args.iter().map(String::as_str));
-    let entries: Vec<Entry> = parse_raw(&git(&command)?)
+    git(&command)
+}
+
+fn top_level() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(String::from_utf8_lossy(&git(&["rev-parse", "--show-toplevel"])?).trim()))
+}
+
+/// Modification time and size of a file, or "missing".
+pub fn stamp(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let time = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+            format!("{time}:{}", meta.len())
+        }
+        Err(_) => "missing".into(),
+    }
+}
+
+/// Something that changes whenever `changes(args)` (and `untracked(args)`) would: git's list
+/// of changed files, plus the time and size of each working-tree file in it. Editing a file
+/// that is already changed does not change git's list, so the times are needed too.
+pub fn signature(args: &[String], with_untracked: bool) -> anyhow::Result<Vec<u8>> {
+    let root = top_level()?;
+    let raw = raw_diff(args)?;
+    let mut signature = raw.clone();
+    let mut stamp_path = |path: &str| signature.extend(format!("\0{path}={}", stamp(&root.join(path))).into_bytes());
+    for entry in parse_raw(&raw).iter().filter(|e| e.new_id == ZERO) {
+        stamp_path(&entry.new_path);
+    }
+    if with_untracked {
+        for name in untracked_names(args)? {
+            stamp_path(&name);
+        }
+    }
+    Ok(signature)
+}
+
+/// The changed files for `git diff <args>`, with both versions read into memory.
+pub fn changes(args: &[String]) -> anyhow::Result<Vec<Change>> {
+    let root = top_level()?;
+    let entries: Vec<Entry> = parse_raw(&raw_diff(args)?)
         .into_iter()
         .filter(|e| e.old_mode != SUBMODULE_MODE && e.new_mode != SUBMODULE_MODE)
         .collect();
@@ -158,23 +197,28 @@ fn worktree_and_pathspecs(args: &[String]) -> (bool, Vec<String>) {
 /// Untracked files that are not ignored, as new files, for a `git diff <args>` that compares
 /// with the working tree. Other comparisons get none. The same pathspecs apply.
 pub fn untracked(args: &[String]) -> anyhow::Result<Vec<Change>> {
+    let root = top_level()?;
+    Ok(untracked_names(args)?
+        .into_iter()
+        .filter_map(|name| {
+            let new = std::fs::read(root.join(&name)).ok()?;
+            Some(Change { old_name: name.clone(), new_name: name, old: Vec::new(), new })
+        })
+        .collect())
+}
+
+/// Untracked, not ignored paths from the top of the repository, when `git diff <args>`
+/// compares with the working tree.
+fn untracked_names(args: &[String]) -> anyhow::Result<Vec<String>> {
     let (worktree, pathspecs) = worktree_and_pathspecs(args);
     if !worktree {
         return Ok(Vec::new());
     }
-    let root = PathBuf::from(String::from_utf8_lossy(&git(&["rev-parse", "--show-toplevel"])?).trim());
     // --full-name gives paths from the top of the repository, like `git diff --raw`.
     let mut command = vec!["-c", "core.quotepath=false", "ls-files", "-z", "--others", "--exclude-standard", "--full-name", "--"];
     command.extend(pathspecs.iter().map(String::as_str));
     let listed = git(&command)?;
-    Ok(String::from_utf8_lossy(&listed)
-        .split('\0')
-        .filter(|name| !name.is_empty())
-        .filter_map(|name| {
-            let new = std::fs::read(root.join(name)).ok()?;
-            Some(Change { old_name: name.to_owned(), new_name: name.to_owned(), old: Vec::new(), new })
-        })
-        .collect())
+    Ok(String::from_utf8_lossy(&listed).split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect())
 }
 
 #[cfg(test)]

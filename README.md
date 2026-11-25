@@ -67,6 +67,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 
 - `--untracked`: also show untracked files (not ignored) as new files, when the diff compares with the working tree (not with `--cached` or two commits). Pathspecs apply to them too.
 - `--ignore-imports`: compare lines without import statements (JavaScript, TypeScript, Python, Rust, Go). A file whose only changes are imports drops out.
+- `--watch[=INTERVAL]`: reload when the files change, and stay on the same file and line. It checks every second (or every INTERVAL, such as `500ms` or `2s`) by asking git for the changed files and looking at their times. Works in git mode and two-path mode.
 - `-U, --context N`: unchanged lines shown around each change (default 3). When a fold hides the line that starts the function (or method, or class) around the next change, that line stays visible inside the fold.
 - `--graphics auto|kitty|blocks`: how to draw ribbons.
 - `--theme NAME`: syntect theme (default `base16-ocean.dark`).
