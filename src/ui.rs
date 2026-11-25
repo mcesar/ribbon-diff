@@ -611,10 +611,16 @@ fn clear(buf: &mut Buffer, area: Rect, style: Style) {
 fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     let style = app.theme.panel().fg(app.theme.muted());
     clear(buf, area, style);
+    // Say which side is alone on screen, and how to get both back.
+    let side = match app.panes {
+        Panes::Both => "",
+        Panes::Old => " OLD SIDE ONLY (< both)  ·",
+        Panes::New => " NEW SIDE ONLY (> both)  ·",
+    };
     let file_part = if app.files.len() > 1 {
-        format!(" file {}/{}  ·", file + 1, app.files.len())
+        format!("{side} file {}/{}  ·", file + 1, app.files.len())
     } else {
-        String::new()
+        side.to_owned()
     };
     let message = match (&app.notice, &app.search) {
         (Some(notice), _) => Some(format!(" {notice}")),

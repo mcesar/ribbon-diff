@@ -8,9 +8,11 @@
 //!
 //! When stdout is not a terminal (a pager, a pipe), ribbon prints a unified diff instead.
 
+mod context;
 mod git;
 mod gutter;
 mod highlight;
+mod imports;
 mod model;
 mod search;
 mod select;
@@ -49,6 +51,8 @@ OPTIONS:
                                 blank lines alone are not highlighted or counted
     --untracked                 also show untracked files (not ignored) as new files, when
                                 comparing with the working tree
+    --ignore-imports            compare lines without import statements; changes to imports
+                                alone are not highlighted or counted
     -U, --context N             unchanged lines shown around each change (default: 3)
     --theme NAME                terminal (default: the terminal's own colors), or a syntect theme
     --graphics auto|kitty|blocks
@@ -71,6 +75,7 @@ struct Options {
     name: Option<String>,
     ignore_whitespace: bool,
     ignore_comments: bool,
+    ignore_imports: bool,
     untracked: bool,
     graphics: Option<Graphics>,
     theme: String,
@@ -83,6 +88,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         name: None,
         ignore_whitespace: false,
         ignore_comments: false,
+        ignore_imports: false,
         untracked: false,
         graphics: None,
         theme: highlight::DEFAULT_THEME.into(),
@@ -100,6 +106,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         match arg.as_str() {
             "-w" | "--ignore-all-space" => options.ignore_whitespace = true,
             "--ignore-comments" => options.ignore_comments = true,
+            "--ignore-imports" => options.ignore_imports = true,
             "--untracked" => options.untracked = true,
             "-h" | "--help" => {
                 print!("{HELP}");
@@ -275,12 +282,19 @@ fn looks_like_revision(arg: &str) -> bool {
 fn model_for(pair: &Pair, options: &Options, highlighter: &Highlighter) -> Model {
     let old = model::split_lines(&String::from_utf8_lossy(&pair.old));
     let new = model::split_lines(&String::from_utf8_lossy(&pair.new));
-    if !options.ignore_whitespace && !options.ignore_comments {
+    if !options.ignore_whitespace && !options.ignore_comments && !options.ignore_imports {
         return Model::from_lines(old, new, None);
     }
     let keys = |lines: &[String], name: &str| -> Vec<String> {
         let comments = if options.ignore_comments { highlighter.comment_ranges(name, lines) } else { vec![Vec::new(); lines.len()] };
-        lines.iter().zip(&comments).map(|(line, ranges)| model::line_key(line, ranges, options.ignore_whitespace)).collect()
+        let imports = if options.ignore_imports { imports::import_lines(lines) } else { vec![false; lines.len()] };
+        // An empty key makes a line count as unchanged, like a blank line.
+        lines
+            .iter()
+            .zip(&comments)
+            .zip(&imports)
+            .map(|((line, ranges), &import)| if import { String::new() } else { model::line_key(line, ranges, options.ignore_whitespace) })
+            .collect()
     };
     let (old_keys, new_keys) = (keys(&old, &pair.old_name), keys(&new, &pair.new_name));
     Model::from_lines(old, new, Some((old_keys, new_keys)))

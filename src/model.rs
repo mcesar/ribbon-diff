@@ -308,8 +308,7 @@ impl Display {
                     self.left.push(Item::Line(a_start + i));
                     self.right.push(Item::Line(b_start + i));
                 }
-                self.left.push(Item::Fold(la - head - tail));
-                self.right.push(Item::Fold(lb - head - tail));
+                self.fold_with_context(model, (a_start + head, a_end - tail), (b_start + head, b_end - tail), b_end - tail);
                 for i in 0..tail {
                     self.left.push(Item::Line(a_end - tail + i));
                     self.right.push(Item::Line(b_end - tail + i));
@@ -336,6 +335,55 @@ impl Display {
             self.right.push(Item::Line(b + i));
         }
     }
+}
+
+/// Most definitions shown inside one fold.
+const MAX_FOLD_CONTEXT: usize = 4;
+
+impl Display {
+    /// Fold the hidden lines `a0..a1` and `b0..b1`, but show the definitions among them that
+    /// hold `next`, the first new line after the fold (its function, class, and so on):
+    /// "12 unchanged lines", the function line, "30 unchanged lines".
+    fn fold_with_context(&mut self, model: &Model, (a0, a1): (usize, usize), (b0, b1): (usize, usize), next: usize) {
+        let openers = if next < model.new.len() { crate::context::definitions(&model.new, next) } else { Vec::new() };
+        let mut shown: Vec<(usize, usize)> =
+            openers.into_iter().filter(|&b| b >= b0 && b < b1).filter_map(|b| Some((old_line(model, (a0, b0), b)?, b))).collect();
+        let extra = shown.len().saturating_sub(MAX_FOLD_CONTEXT);
+        shown.drain(..extra);
+        let (mut a, mut b) = (a0, b0);
+        for (line_a, line_b) in shown.into_iter().chain([(a1, b1)]) {
+            match (line_a - a, line_b - b) {
+                (0, 0) => {}
+                // One hidden line is shown instead of a marker for it.
+                (1, 1) => {
+                    self.left.push(Item::Line(a));
+                    self.right.push(Item::Line(b));
+                }
+                (hidden_a, hidden_b) => {
+                    self.left.push(Item::Fold(hidden_a));
+                    self.right.push(Item::Fold(hidden_b));
+                }
+            }
+            if line_b < b1 {
+                self.left.push(Item::Line(line_a));
+                self.right.push(Item::Line(line_b));
+            }
+            (a, b) = (line_a + 1, line_b + 1);
+        }
+    }
+}
+
+/// The old line paired with unchanged new line `b`, counting from a point where both sides are
+/// level. None inside a quiet change (one whose differences are ignored).
+fn old_line(model: &Model, (a0, b0): (usize, usize), b: usize) -> Option<usize> {
+    let mut shift = a0 as isize - b0 as isize;
+    for quiet in model.quiet.iter().filter(|q| q.b0 >= b0 && q.b0 <= b) {
+        if b < quiet.b1 {
+            return None;
+        }
+        shift += (quiet.a1 - quiet.a0) as isize - (quiet.b1 - quiet.b0) as isize;
+    }
+    b.checked_add_signed(shift)
 }
 
 fn push_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>, text: &str) {
@@ -614,5 +662,29 @@ mod tests {
         for row in 0..27 {
             assert_eq!(scroll.tops(scroll.position_of_row(row, false)).1, row, "new row {row}");
         }
+    }
+
+    #[test]
+    fn folds_show_the_lines_that_open_the_blocks_around_the_next_line() {
+        let mut old = String::from("class Upload {\n");
+        for i in 0..10 {
+            old.push_str(&format!("  field{i} = {i}\n"));
+        }
+        old.push_str("  start() {\n");
+        for i in 0..10 {
+            old.push_str(&format!("    step{i}()\n"));
+        }
+        old.push_str("    done()\n  }\n}\n");
+        let new = old.replace("done()", "finish()");
+        let m = model(&old, &new);
+        let d = Display::new(&m, Some(2));
+        // 0 class line; 1..11 fields; 11 start(); 12..22 steps; 22 the change.
+        assert_eq!(
+            d.right[..5],
+            [Item::Line(0), Item::Fold(10), Item::Line(11), Item::Fold(8), Item::Line(20)],
+            "{:?}",
+            d.right
+        );
+        assert_eq!(d.left[..5], d.right[..5]);
     }
 }
