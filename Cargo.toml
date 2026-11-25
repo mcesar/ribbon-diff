@@ -2,6 +2,9 @@
 name = "ribbon"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Side-by-side terminal diff viewer with IntelliJ-style ribbons (Kitty graphics)"
+repository = "https://github.com/mcesar/ribbon-diff"
 
 [dependencies]
 anyhow = "1.0.105"

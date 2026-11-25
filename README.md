@@ -64,3 +64,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 - `--graphics auto|kitty|blocks`: how to draw ribbons.
 - `--theme NAME`: syntect theme (default `base16-ocean.dark`).
 - `--name PATH`: display name, also used to pick the syntax.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
