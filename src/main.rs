@@ -153,19 +153,23 @@ fn parse_interval(text: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs_f64((seconds * scale).max(0.05)))
 }
 
-fn detect_graphics() -> Graphics {
+/// Auto mode: None lets the viewer ask the terminal. Inside tmux the graphics do not reach the
+/// outer terminal, so it is blocks.
+fn auto_graphics() -> Option<Graphics> {
+    let tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    tmux.then_some(Graphics::Blocks)
+}
+
+/// The environment names a terminal known to show Kitty graphics.
+fn kitty_hint() -> bool {
     let var = |name: &str| std::env::var(name).unwrap_or_default().to_lowercase();
-    if !var("TMUX").is_empty() {
-        return Graphics::Blocks;
-    }
     let term = var("TERM");
     let program = var("TERM_PROGRAM");
-    let kitty_like = !var("KITTY_WINDOW_ID").is_empty()
+    !var("KITTY_WINDOW_ID").is_empty()
         || term.contains("kitty")
         || term.contains("ghostty")
         || program == "ghostty"
-        || program == "wezterm";
-    if kitty_like { Graphics::Kitty } else { Graphics::Blocks }
+        || program == "wezterm"
 }
 
 fn read(path: &str) -> anyhow::Result<Vec<u8>> {
@@ -447,7 +451,8 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let reloads = watch.map(|interval| spawn_watcher(options.clone(), Arc::clone(&highlighter), interval, last));
     let settings = Settings {
-        graphics: options.graphics.unwrap_or_else(detect_graphics),
+        graphics: options.graphics.or_else(auto_graphics),
+        kitty_hint: kitty_hint(),
         context: options.context,
         highlighter,
         reloads,

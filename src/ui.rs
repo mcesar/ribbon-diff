@@ -65,7 +65,10 @@ pub struct FileDiff {
 }
 
 pub struct Settings {
-    pub graphics: Graphics,
+    /// None: use Kitty graphics when the terminal answers the Kitty query, or `kitty_hint` is set.
+    pub graphics: Option<Graphics>,
+    /// The environment names a terminal known to show Kitty graphics.
+    pub kitty_hint: bool,
     /// Unchanged lines kept around each change; the `c` key shows the whole file instead.
     pub context: usize,
     pub highlighter: Arc<Highlighter>,
@@ -1316,23 +1319,24 @@ pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> 
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
     io::stdout().write_all(MOUSE_ON.as_bytes())?;
-    let graphics = settings.graphics;
+
+    // Ask before the event loop starts reading the terminal, so the replies are not taken as keys.
+    let terminal_colors = termcolors::query();
+    let kitty = terminal_colors.kitty_graphics || settings.kitty_hint;
+    let graphics = settings.graphics.unwrap_or(if kitty { Graphics::Kitty } else { Graphics::Blocks });
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal(graphics);
         previous_hook(info);
     }));
-
-    // Ask before the event loop starts reading the terminal, so the replies are not taken as keys.
-    let terminal_colors = termcolors::query();
     io::stdout().write_all(KEYS_ON.as_bytes())?;
     io::stdout().flush()?;
-    let result = event_loop(diffs, settings, terminal_colors);
+    let result = event_loop(diffs, settings, graphics, terminal_colors);
     restore_terminal(graphics);
     result
 }
 
-fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermColors) -> anyhow::Result<Outcome> {
+fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, terminal_colors: TermColors) -> anyhow::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
     let stream = Stream::new(&files, Some(settings.context));
@@ -1359,7 +1363,6 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, terminal_colors: TermCol
         panes: Panes::Both,
         generation: 0,
     };
-    let graphics = settings.graphics;
     let mut last_image: Option<(bool, usize, View)> = None;
 
     loop {

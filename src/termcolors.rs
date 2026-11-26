@@ -1,5 +1,6 @@
 //! Ask the terminal for its background and palette colors (OSC 11 and OSC 4), so the ribbon
-//! images match the terminal's color scheme. Call in raw mode, before reading input events.
+//! images match the terminal's color scheme, and whether it shows Kitty graphics. Call in raw
+//! mode, before reading input events.
 
 use crate::highlight::Rgb;
 use std::fs::OpenOptions;
@@ -14,9 +15,15 @@ pub struct TermColors {
     pub red: Option<Rgb>,
     pub green: Option<Rgb>,
     pub blue: Option<Rgb>,
+    /// The terminal answered the Kitty graphics query with OK.
+    pub kitty_graphics: bool,
 }
 
 const TIMEOUT: Duration = Duration::from_millis(400);
+
+/// A Kitty graphics query: a 1x1 RGB image that is checked but not stored. Terminals that
+/// support the protocol answer `ESC _ G i=31;OK ESC \`; others ignore it.
+const KITTY_QUERY: &str = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 
 /// Query the terminal. Every terminal answers the primary device attributes request (`CSI c`),
 /// so its reply marks the end of the color replies, and a terminal that ignores the color
@@ -25,8 +32,8 @@ pub fn query() -> TermColors {
     let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
         return TermColors::default();
     };
-    let request = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\x1b]4;4;?\x1b\\\x1b[c";
-    if tty.write_all(request).and_then(|()| tty.flush()).is_err() {
+    let request = format!("\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\x1b]4;4;?\x1b\\{KITTY_QUERY}\x1b[c");
+    if tty.write_all(request.as_bytes()).and_then(|()| tty.flush()).is_err() {
         return TermColors::default();
     }
 
@@ -79,6 +86,7 @@ fn parse(reply: &str) -> TermColors {
         red: color_after("]4;1;rgb:"),
         green: color_after("]4;2;rgb:"),
         blue: color_after("]4;4;rgb:"),
+        kitty_graphics: reply.contains("_Gi=31;OK"),
     }
 }
 
@@ -107,6 +115,8 @@ mod tests {
         assert_eq!(colors.green, Some([0xa6, 0xda, 0x95]));
         assert_eq!(colors.red, Some([0xed, 0x87, 0x96]));
         assert_eq!(colors.blue, None);
+        assert!(!colors.kitty_graphics);
+        assert!(parse("\x1b_Gi=31;OK\x1b\\\x1b[?62c").kitty_graphics);
         assert!(has_device_attributes(reply.as_bytes()));
     }
 }
