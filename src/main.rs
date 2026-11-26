@@ -65,7 +65,7 @@ OPTIONS:
     -V, --version               show the version
 
 KEYS:
-    j/k, arrows, wheel  scroll        space/b  page        d/u  half page
+    j/k, arrows, wheel  scroll        space/S-space  page        d/u  half page
     h/l, H/L, 0         scroll sideways
     n/N                 next/prev change         ]/[      next/prev file
     f, Tab              file list                c        whole file / changes only

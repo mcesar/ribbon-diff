@@ -40,6 +40,12 @@ const DELETE: Rgb = [224, 98, 88];
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+/// Kitty keyboard protocol: report every key as an escape code (8) with its shifted form (4),
+/// so Shift+Space differs from Space. Terminals without the protocol ignore it. Pushed on the
+/// alternate screen and popped before leaving it, since each screen keeps its own flags.
+const KEYS_ON: &str = "\x1b[>13u";
+const KEYS_OFF: &str = "\x1b[<u";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Graphics {
     Kitty,
@@ -679,7 +685,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     }
     let context = if app.whole_file { "c: context" } else { "c: whole file" };
     let text = format!(
-        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  </> one side  / search  h/l j/k space/b g/G scroll  q quit",
+        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  </> one side  / search  h/l j/k space/S-space g/G scroll  q quit",
         app.current_change(),
         app.stream.blocks.len(),
         if app.hscroll > 0 { format!("  ·  col {}", app.hscroll + 1) } else { String::new() },
@@ -1000,8 +1006,9 @@ impl App {
                     KeyCode::Char('b') if ctrl => self.scrolled(position, -(page as isize)),
                     KeyCode::Char('d') => self.scrolled(position, page as isize / 2),
                     KeyCode::Char('u') => self.scrolled(position, -(page as isize / 2)),
+                    KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::SHIFT) => self.scrolled(position, -(page as isize)),
                     KeyCode::Char(' ') | KeyCode::PageDown => self.scrolled(position, page as isize),
-                    KeyCode::Char('b') | KeyCode::PageUp => self.scrolled(position, -(page as isize)),
+                    KeyCode::PageUp => self.scrolled(position, -(page as isize)),
                     // Show one side alone; the same key again shows both.
                     KeyCode::Char('<') => {
                         self.panes = if self.panes == Panes::Old { Panes::Both } else { Panes::Old };
@@ -1300,6 +1307,7 @@ pub fn restore_terminal(graphics: Graphics) {
         let _ = out.write_all(gutter::kitty_delete().as_bytes());
     }
     let _ = out.write_all(MOUSE_OFF.as_bytes());
+    let _ = out.write_all(KEYS_OFF.as_bytes());
     let _ = execute!(out, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
 }
@@ -1317,6 +1325,8 @@ pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> 
 
     // Ask before the event loop starts reading the terminal, so the replies are not taken as keys.
     let terminal_colors = termcolors::query();
+    io::stdout().write_all(KEYS_ON.as_bytes())?;
+    io::stdout().flush()?;
     let result = event_loop(diffs, settings, terminal_colors);
     restore_terminal(graphics);
     result

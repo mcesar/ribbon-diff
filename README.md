@@ -48,7 +48,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | --- | --- |
 | `j` / `k`, arrows, mouse wheel | scroll |
 | `h` / `l`, `H` / `L`, `0`, Shift + wheel | scroll sideways |
-| `space` / `b` | page down / up |
+| `space` / `Shift+Space` | page down / up (`Shift+Space` needs the Kitty keyboard protocol: Ghostty, Kitty, WezTerm; `PageUp` works everywhere) |
 | `d` / `u` | half page down / up |
 | `n` / `N` | next / previous change (continues into the next / previous file) |
 | `]` / `[` | next / previous file |
