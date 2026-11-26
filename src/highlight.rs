@@ -121,31 +121,36 @@ impl Highlighter {
         }
     }
 
-    /// Byte ranges of comments in each line, for `--ignore-comments`.
-    pub fn comment_ranges(&self, path: &str, lines: &[String]) -> Vec<Vec<std::ops::Range<usize>>> {
+    /// Byte ranges of comments in each line, for `--ignore-comments`. Only the lines marked in
+    /// `wanted` are parsed; each run of them starts from a fresh parse state, and the other
+    /// lines get no ranges. Parsing whole files is slow (seconds for a large TypeScript file).
+    pub fn comment_ranges(&self, path: &str, lines: &[String], wanted: &[bool]) -> Vec<Vec<std::ops::Range<usize>>> {
+        let mut all = vec![Vec::new(); lines.len()];
         if lines.len() > MAX_HIGHLIGHT_LINES {
-            return vec![Vec::new(); lines.len()];
+            return all;
         }
         let syntax = self.syntax_for(path, lines.first().map(String::as_str));
-        let mut state = HighlightLines::new(syntax, &self.markers);
-        lines
-            .iter()
-            .map(|line| {
-                let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-                let mut offset = 0;
-                for (style, text) in state.highlight_line(line, &self.syntaxes).unwrap_or_default() {
-                    let end = offset + text.len();
-                    if style.foreground.r == COMMENT {
-                        match ranges.last_mut() {
-                            Some(last) if last.end == offset => last.end = end,
-                            _ => ranges.push(offset..end),
-                        }
+        let mut state = None;
+        for (index, line) in lines.iter().enumerate() {
+            if !wanted.get(index).copied().unwrap_or(false) {
+                state = None;
+                continue;
+            }
+            let state = state.get_or_insert_with(|| HighlightLines::new(syntax, &self.markers));
+            let ranges: &mut Vec<std::ops::Range<usize>> = &mut all[index];
+            let mut offset = 0;
+            for (style, text) in state.highlight_line(line, &self.syntaxes).unwrap_or_default() {
+                let end = offset + text.len();
+                if style.foreground.r == COMMENT {
+                    match ranges.last_mut() {
+                        Some(last) if last.end == offset => last.end = end,
+                        _ => ranges.push(offset..end),
                     }
-                    offset = end;
                 }
-                ranges
-            })
-            .collect()
+                offset = end;
+            }
+        }
+        all
     }
 
     pub fn highlight(&self, path: &str, lines: &[String]) -> Vec<Tokens> {
@@ -181,7 +186,7 @@ mod tests {
     fn finds_comments_in_any_theme() {
         let h = Highlighter::new("base16-ocean.dark").unwrap();
         let lines = vec!["let a = 1 // note".to_owned(), "/* block".to_owned(), "   still */ b()".to_owned()];
-        let ranges = h.comment_ranges("a.ts", &lines);
+        let ranges = h.comment_ranges("a.ts", &lines, &vec![true; lines.len()]);
         assert_eq!(&lines[0][ranges[0][0].clone()], "// note");
         assert_eq!(&lines[1][ranges[1][0].clone()], "/* block");
         assert_eq!(&lines[2][ranges[2][0].clone()], "   still */");

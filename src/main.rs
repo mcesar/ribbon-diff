@@ -300,6 +300,10 @@ fn looks_like_revision(arg: &str) -> bool {
             .is_ok_and(|out| out.status.success())
 }
 
+/// Lines parsed before each change for `--ignore-comments`, so a comment that starts above
+/// the change is still seen.
+const COMMENT_LOOKBACK: usize = 100;
+
 /// Diff one file, comparing by keys when whitespace or comments are ignored.
 fn model_for(pair: &Pair, options: &Options, highlighter: &Highlighter) -> Model {
     let old = model::split_lines(&String::from_utf8_lossy(&pair.old));
@@ -307,8 +311,11 @@ fn model_for(pair: &Pair, options: &Options, highlighter: &Highlighter) -> Model
     if !options.ignore_whitespace && !options.ignore_comments && !options.ignore_imports {
         return Model::from_lines(old, new, None);
     }
-    let keys = |lines: &[String], name: &str| -> Vec<String> {
-        let comments = if options.ignore_comments { highlighter.comment_ranges(name, lines) } else { vec![Vec::new(); lines.len()] };
+    // Finding comments needs a syntax parse, so it is done only near the changes.
+    let (old_near, new_near) =
+        if options.ignore_comments { model::near_changes(&old, &new, COMMENT_LOOKBACK) } else { Default::default() };
+    let keys = |lines: &[String], name: &str, near: &[bool]| -> Vec<String> {
+        let comments = if options.ignore_comments { highlighter.comment_ranges(name, lines, near) } else { vec![Vec::new(); lines.len()] };
         let imports = if options.ignore_imports { imports::import_lines(lines) } else { vec![false; lines.len()] };
         // An empty key makes a line count as unchanged, like a blank line.
         lines
@@ -318,7 +325,7 @@ fn model_for(pair: &Pair, options: &Options, highlighter: &Highlighter) -> Model
             .map(|((line, ranges), &import)| if import { String::new() } else { model::line_key(line, ranges, options.ignore_whitespace) })
             .collect()
     };
-    let (old_keys, new_keys) = (keys(&old, &pair.old_name), keys(&new, &pair.new_name));
+    let (old_keys, new_keys) = (keys(&old, &pair.old_name, &old_near), keys(&new, &pair.new_name, &new_near));
     Model::from_lines(old, new, Some((old_keys, new_keys)))
 }
 
@@ -344,14 +351,32 @@ fn load(options: &Options, highlighter: &Highlighter, report: bool) -> anyhow::R
     }
 
     // Files whose only changes are ignored (whitespace, comments) drop out, as with `git diff -w`.
-    Ok(text_pairs
-        .into_iter()
-        .map(|pair| {
-            let model = model_for(&pair, options, highlighter);
-            (pair, model)
-        })
-        .filter(|(_, model)| !model.blocks.is_empty())
-        .collect())
+    let models = parallel_map(&text_pairs, |pair| model_for(pair, options, highlighter));
+    Ok(text_pairs.into_iter().zip(models).filter(|(_, model)| !model.blocks.is_empty()).collect())
+}
+
+/// `items.iter().map(f)` on all cores, in order. Each thread takes the next item when it is
+/// done, so one large file does not hold up the others.
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len());
+    let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else { break done };
+                        done.push((index, f(item)));
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|worker| worker.join().unwrap_or_default()).collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn file_diffs(diffs: Vec<(Pair, Model)>) -> Vec<FileDiff> {

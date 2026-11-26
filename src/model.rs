@@ -108,6 +108,28 @@ impl Model {
     }
 }
 
+/// Lines that are changed in a plain line diff, or among the `lookback` lines before a change.
+/// The marks are the same on both sides for lines that are equal, so ignored parts found in
+/// them give the same keys on both sides.
+pub fn near_changes(old: &[String], new: &[String], lookback: usize) -> (Vec<bool>, Vec<bool>) {
+    let (old_refs, new_refs): (Vec<&str>, Vec<&str>) = (old.iter().map(String::as_str).collect(), new.iter().map(String::as_str).collect());
+    let diff = TextDiff::configure().algorithm(Algorithm::Myers).timeout(Duration::from_secs(2)).diff_slices(&old_refs, &new_refs);
+    let (mut old_marks, mut new_marks) = (vec![false; old.len()], vec![false; new.len()]);
+    let ops = diff.ops();
+    for (index, op) in ops.iter().enumerate() {
+        let (tag, a, b) = op.as_tag_tuple();
+        if tag != DiffTag::Equal {
+            old_marks[a].fill(true);
+            new_marks[b].fill(true);
+        } else if index + 1 < ops.len() {
+            let keep = a.len().min(lookback);
+            old_marks[a.end - keep..a.end].fill(true);
+            new_marks[b.end - keep..b.end].fill(true);
+        }
+    }
+    (old_marks, new_marks)
+}
+
 /// The comparison key of a line: without whitespace (`-w`) and/or without comments.
 pub fn line_key(line: &str, comments: &[Range<usize>], ignore_whitespace: bool) -> String {
     let mut key = String::with_capacity(line.len());
@@ -613,6 +635,14 @@ mod tests {
     fn no_word_marks_when_most_of_the_line_changed() {
         let (old, new) = inline_changes("expect(a).toBe(1)", "// a comment about something else");
         assert!(old.is_empty() && new.is_empty());
+    }
+
+    #[test]
+    fn near_changes_marks_changes_and_the_lines_before_them_on_both_sides() {
+        let lines = |text: &str| text.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let (old, new) = near_changes(&lines("a b c d e f"), &lines("a b c X d e f"), 2);
+        assert_eq!(old, [false, true, true, false, false, false]);
+        assert_eq!(new, [false, true, true, true, false, false, false]);
     }
 
     #[test]
