@@ -80,8 +80,33 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `y` / `Esc` | copy the selection again / clear it |
 | `y` with no selection | copy: `p` path, `a` absolute path, `f` file name, `l` path:line, `c` the change |
 | `Y` | copy the current change (or the one with the selection) as a patch; with one side alone, that side's lines |
+| `a` | add a note for Claude on the selected lines, or the line `e` would open |
+| `}` / `{` | next / previous note |
+| `A` | list of all notes (`Enter` goes to one, `x` deletes it) |
+| `x` | delete the note picked with `}` / `{` |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |
+
+## Notes for Claude
+
+Select lines (or scroll to a change) and press `a` to write a note, such as "use a constant
+here". Notes are kept in `.ribbon/notes.json` at the top of the repository; the `.ribbon`
+folder ignores itself in git. Each note shows under its last line, and a note inside a fold
+opens the fold.
+
+Then ask Claude to handle the notes. `ribbon skill` prints a Claude Code skill that teaches it
+the file: Claude makes the changes, marks each note `done`, and adds a reply. It can also add
+its own notes that explain why it changed something. ribbon reads the file again every
+second, so replies show at once; with `--watch`, the code changes do too.
+
+To install the skill:
+
+```sh
+mkdir -p ~/.claude/skills/ribbon-notes && ribbon skill > ~/.claude/skills/ribbon-notes/SKILL.md
+```
+
+The file uses [Hunk](https://github.com/modem-dev/hunk)'s agent-context format, so Hunk can read
+it too. `--agent-context FILE` shows such a file from another tool, read-only.
 
 ## Options
 
@@ -89,6 +114,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 - `--ignore-imports`: compare lines without import statements (JavaScript, TypeScript, Python, Rust, Go). A file whose only changes are imports drops out.
 - `--watch[=INTERVAL]`: reload when the files change, and stay on the same file and line. It checks every second (or every INTERVAL, such as `500ms` or `2s`) by asking git for the changed files and looking at their times. Works in git mode and two-path mode.
 - `-U, --context N`: unchanged lines shown around each change (default 3). When a fold hides the line that starts the function (or method, or class) around the next change, that line stays visible inside the fold.
+- `--agent-context FILE`: show notes from an agent beside the diff, read-only (Hunk's agent-context JSON).
 - `--graphics auto|kitty|blocks`: how to draw ribbons. `auto` asks the terminal if it shows Kitty graphics.
 - `--theme NAME`: syntect theme (default `base16-ocean.dark`).
 - `--name PATH`: display name, also used to pick the syntax.

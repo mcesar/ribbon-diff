@@ -1,7 +1,7 @@
 //! Line diff, change blocks, and the IntelliJ-style scroll mapping between the two sides.
 
 use similar::{Algorithm, ChangeTag, DiffTag, TextDiff};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -282,11 +282,11 @@ const MIN_FOLD: usize = 2;
 impl Display {
     #[cfg(test)]
     pub fn new(model: &Model, context: Option<usize>) -> Self {
-        Display::with_open(model, context, &HashSet::new())
+        Display::with_open(model, context, &Keep::default())
     }
 
-    /// Like `new`, but the folds that start at a new line in `opened` show their lines.
-    pub fn with_open(model: &Model, context: Option<usize>, opened: &HashSet<usize>) -> Self {
+    /// Like `new`, but some folds show their lines: see `Keep`.
+    pub fn with_open(model: &Model, context: Option<usize>, opened: &Keep) -> Self {
         let mut display = Display { left: Vec::new(), right: Vec::new(), blocks: Vec::new(), scroll_blocks: Vec::new(), folds: Vec::new() };
         let (mut a, mut b) = (0, 0);
         for (index, block) in model.blocks.iter().enumerate() {
@@ -330,7 +330,7 @@ impl Display {
         before: bool,
         after: bool,
         context: Option<usize>,
-        opened: &HashSet<usize>,
+        opened: &Keep,
     ) {
         let (la, lb) = (a_end - a_start, b_end - b_start);
         if let Some(n) = context {
@@ -376,6 +376,15 @@ impl Display {
     }
 }
 
+/// What folds must show: the folds opened by hand, named by the first new line they hide,
+/// and lines that must stay visible (lines with notes), on each side.
+#[derive(Debug, Default, Clone)]
+pub struct Keep {
+    pub folds: HashSet<usize>,
+    pub old: BTreeSet<usize>,
+    pub new: BTreeSet<usize>,
+}
+
 /// Most definitions shown inside one fold.
 const MAX_FOLD_CONTEXT: usize = 4;
 
@@ -383,7 +392,7 @@ impl Display {
     /// Fold the hidden lines `a0..a1` and `b0..b1`, but show the definitions among them that
     /// hold `next`, the first new line after the fold (its function, class, and so on):
     /// "12 unchanged lines", the function line, "30 unchanged lines".
-    fn fold_with_context(&mut self, model: &Model, (a0, a1): (usize, usize), (b0, b1): (usize, usize), next: usize, opened: &HashSet<usize>) {
+    fn fold_with_context(&mut self, model: &Model, (a0, a1): (usize, usize), (b0, b1): (usize, usize), next: usize, opened: &Keep) {
         let openers = if next < model.new.len() { crate::context::definitions(&model.new, next) } else { Vec::new() };
         let mut shown: Vec<(usize, usize)> =
             openers.into_iter().filter(|&b| b >= b0 && b < b1).filter_map(|b| Some((old_line(model, (a0, b0), b)?, b))).collect();
@@ -398,7 +407,9 @@ impl Display {
                     self.left.push(Item::Line(a));
                     self.right.push(Item::Line(b));
                 }
-                _ if opened.contains(&b) => self.unfolded(model, (a, line_a), (b, line_b)),
+                _ if opened.folds.contains(&b) || opened.new.range(b..line_b).next().is_some() || opened.old.range(a..line_a).next().is_some() => {
+                    self.unfolded(model, (a, line_a), (b, line_b))
+                }
                 (hidden_a, hidden_b) => {
                     self.folds.push((self.left.len(), self.right.len(), b));
                     self.left.push(Item::Fold(hidden_a));
@@ -662,7 +673,8 @@ mod tests {
         let m = model(&numbers(30), &numbers(30).replace("\n15\n", "\nfifteen\n"));
         let folded = Display::new(&m, Some(2));
         assert_eq!(folded.folds, vec![(0, 0, 0), (6, 6, 17)]);
-        let opened = Display::with_open(&m, Some(2), &HashSet::from([17]));
+        let opened = Display::with_open(&m, Some(2), &Keep { folds: HashSet::from([17]), ..Keep::default() });
+        assert_eq!(opened.right, Display::with_open(&m, Some(2), &Keep { new: BTreeSet::from([25]), ..Keep::default() }).right);
         assert_eq!(opened.folds, vec![(0, 0, 0)]);
         assert_eq!(opened.right.len(), 1 + 2 + 1 + 2 + 13);
         assert!(opened.right.ends_with(&[Item::Line(28), Item::Line(29)]));

@@ -14,6 +14,7 @@ mod ribbons;
 mod highlight;
 mod imports;
 mod model;
+mod notes;
 mod patch;
 mod search;
 mod select;
@@ -31,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use ui::{FileDiff, Graphics, Outcome, Settings};
+
+/// Instructions for Claude to act on notes: `ribbon skill`.
+const SKILL: &str = include_str!("../skills/ribbon-notes/SKILL.md");
 
 const HELP: &str = "\
 ribbon - side-by-side diff with IntelliJ-style ribbons (Kitty graphics)
@@ -62,6 +66,7 @@ OPTIONS:
                                 alone are not highlighted or counted
     --watch[=INTERVAL]          reload when the files change (git and two-path modes); checks
                                 every second, or every INTERVAL such as 500ms or 2s
+    --agent-context FILE        show notes from an agent beside the diff (Hunk's format)
     -U, --context N             unchanged lines shown around each change (default: 3)
     --theme NAME                terminal (default: the terminal's own colors), or a syntect theme
     --graphics auto|kitty|blocks
@@ -83,6 +88,12 @@ KEYS:
     e                   open in $EDITOR at the selected or first changed line
     y (no selection)    copy: p path, a absolute path, f file name, l path:line, c change
     Y                   copy the change as a patch (one side alone: its lines)
+    a                   add a note for Claude on the selected or first changed line
+    } / {               next/prev note          A        all notes      x  delete note
+
+NOTES:
+    Notes are kept in .ribbon/notes.json at the top of the repository, and show again when
+    the file changes. `ribbon skill` prints instructions that teach Claude to act on them.
 ";
 
 #[derive(Clone)]
@@ -99,6 +110,8 @@ struct Options {
     positional: Vec<String>,
     /// A patch to show instead of asking git (from stdin, a .patch file, or as a pager).
     patch: Option<String>,
+    /// Notes from an agent, in Hunk's agent-context format.
+    agent_context: Option<PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Option<Options>> {
@@ -114,6 +127,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         context: 3,
         positional: Vec::new(),
         patch: None,
+        agent_context: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -139,6 +153,8 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
                 return Ok(None);
             }
             "--name" => options.name = Some(args.next().context("--name needs a value")?),
+            "--agent-context" => options.agent_context = Some(args.next().context("--agent-context needs a file")?.into()),
+            _ if arg.starts_with("--agent-context=") => options.agent_context = Some(arg["--agent-context=".len()..].into()),
             "--theme" => options.theme = args.next().context("--theme needs a value")?,
             "--context" | "-U" => {
                 options.context = args.next().context("--context needs a number")?.parse().context("--context needs a number")?
@@ -541,6 +557,10 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     let mut notice = None;
+    if options.positional.first().is_some_and(|c| c == "skill") {
+        print!("{SKILL}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some((args, about)) = subcommand(&options.positional) {
         options.positional = args;
         notice = about;
@@ -616,6 +636,9 @@ fn run() -> anyhow::Result<ExitCode> {
         reloads,
         load_again,
         notice,
+        // Notes live at the top of the repository, or in the current folder outside git.
+        notes_file: notes::notes_file(&git::top_level().unwrap_or_else(|_| PathBuf::from("."))),
+        agent_context: options.agent_context.clone(),
     };
     let files = file_diffs(diffs);
     Ok(match ui::run(files, settings)? {

@@ -3,7 +3,8 @@
 use crate::ribbons::{self, RibbonColors, View};
 use crate::highlight::{Highlighter, Paint, Rgb, Tokens};
 use crate::termcolors::{self, TermColors};
-use crate::model::{Block, BlockKind, Display, Item, Model, ScrollMap};
+use crate::model::{Block, BlockKind, Display, Item, Keep, Model, ScrollMap};
+use crate::notes::{self, Note};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use crate::search::{self, Match, Search};
@@ -80,6 +81,10 @@ pub struct Settings {
     pub reloads: Option<mpsc::Receiver<Vec<FileDiff>>>,
     /// Read the changed files again, after the editor closes (without `--watch`).
     pub load_again: Option<Box<dyn Fn() -> Vec<FileDiff>>>,
+    /// Where notes for Claude are kept: `.ribbon/notes.json`.
+    pub notes_file: PathBuf,
+    /// Notes from an agent to show, read-only (`--agent-context`).
+    pub agent_context: Option<PathBuf>,
     /// Shown in the status line at the start, such as the commit for `ribbon show`.
     pub notice: Option<String>,
 }
@@ -175,8 +180,20 @@ enum Row {
     /// Hidden unchanged lines: file, how many, and the first new line hidden (which names the
     /// fold for opening it).
     Fold(usize, usize, usize),
+    /// One row of a note under a line: the note's index in the app's notes, and which row.
+    Note(usize, usize),
     /// Space between two files.
     Gap,
+}
+
+/// Where one note shows: under `line` of `file`, on one side, taking `rows` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NoteRows {
+    file: usize,
+    old_side: bool,
+    line: usize,
+    note: usize,
+    rows: usize,
 }
 
 /// Every file one after another, like `git diff` or a pull request page. Header and gap rows
@@ -195,7 +212,7 @@ struct Stream {
 impl Stream {
     /// `opened` holds the folds to show, as (new file name, first new line hidden). With
     /// `wrap`, long lines take more rows, and the shorter of two level lines gets blank rows.
-    fn new(files: &[FileState], context: Option<usize>, opened: &HashSet<(String, usize)>, wrap: Option<usize>) -> Self {
+    fn new(files: &[FileState], context: Option<usize>, opened: &HashSet<(String, usize)>, wrap: Option<usize>, notes: &[NoteRows]) -> Self {
         let (mut left, mut right, mut headers) = (Vec::new(), Vec::new(), Vec::new());
         let (mut blocks, mut scroll_blocks) = (Vec::new(), Vec::new());
         for (index, file) in files.iter().enumerate() {
@@ -207,7 +224,13 @@ impl Stream {
             left.push(Row::Header(index));
             right.push(Row::Header(index));
             let name = &file.diff.new_name;
-            let open: HashSet<usize> = opened.iter().filter(|(n, _)| n == name).map(|&(_, start)| start).collect();
+            let file_notes: Vec<&NoteRows> = notes.iter().filter(|n| n.file == index).collect();
+            // Lines with notes stay visible.
+            let open = Keep {
+                folds: opened.iter().filter(|(n, _)| n == name).map(|&(_, start)| start).collect(),
+                old: file_notes.iter().filter(|n| n.old_side).map(|n| n.line).collect(),
+                new: file_notes.iter().filter(|n| !n.old_side).map(|n| n.line).collect(),
+            };
             let display = Display::with_open(&file.diff.model, context, &open);
             let row = |old_side: bool| {
                 let display = &display;
@@ -239,8 +262,8 @@ impl Stream {
                 }
             }
 
-            if let Some(width) = wrap {
-                wrap_rows(file, width, (&mut file_left, &mut file_right), (&mut file_blocks, &mut file_scroll_blocks));
+            if wrap.is_some() || !file_notes.is_empty() {
+                expand_rows(file, wrap, &file_notes, (&mut file_left, &mut file_right), (&mut file_blocks, &mut file_scroll_blocks));
             }
 
             let (left_start, right_start) = (left.len(), right.len());
@@ -284,24 +307,34 @@ impl Stream {
     }
 }
 
-/// Give each long line one more row per `width` columns. Outside changes, the rows of the two
-/// sides are level pairs: both get as many rows as the longer of the two, so they stay level
-/// (lines that only look equal, with `-w`, can wrap differently). Blocks move to match.
-fn wrap_rows(file: &FileState, width: usize, (left, right): (&mut Vec<Row>, &mut Vec<Row>), (blocks, scroll_blocks): (&mut [Block], &mut [Block])) {
-    let width = width.max(1);
+/// Give each long line one more row per `width` columns (with wrapping on), and each line
+/// with notes the rows of its notes. Outside changes, the rows of the two sides are level
+/// pairs: both get as many rows as the taller of the two, so they stay level (lines that only
+/// look equal, with `-w`, can wrap differently). Blocks move to match.
+fn expand_rows(
+    file: &FileState,
+    wrap: Option<usize>,
+    notes: &[&NoteRows],
+    (left, right): (&mut Vec<Row>, &mut Vec<Row>),
+    (blocks, scroll_blocks): (&mut [Block], &mut [Block]),
+) {
     let model = &file.diff.model;
-    let parts = |row: Row, old_side: bool| match row {
-        Row::Line(_, line) => {
+    let rows_of = |row: Row, old_side: bool| -> Vec<Row> {
+        let Row::Line(f, line) = row else { return vec![row] };
+        let mut rows = vec![row];
+        if let Some(width) = wrap {
             let text = if old_side { &model.old[line] } else { &model.new[line] };
-            select::line_width(text).div_ceil(width).max(1)
+            let parts = select::line_width(text).div_ceil(width.max(1)).max(1);
+            rows.extend((1..parts).map(|part| Row::Wrap(f, line, part)));
         }
-        _ => 1,
+        for note in notes.iter().filter(|n| n.old_side == old_side && n.line == line) {
+            rows.extend((0..note.rows).map(|part| Row::Note(note.note, part)));
+        }
+        rows
     };
-    let push = |out: &mut Vec<Row>, row: Row, count: usize, height: usize| {
-        out.push(row);
-        if let Row::Line(f, line) = row {
-            out.extend((1..count).map(|part| Row::Wrap(f, line, part)));
-        }
+    let push = |out: &mut Vec<Row>, rows: Vec<Row>, height: usize| {
+        let count = rows.len();
+        out.extend(rows);
         out.extend(std::iter::repeat_n(Row::Gap, height - count));
     };
     let (mut new_left, mut new_right) = (Vec::new(), Vec::new());
@@ -312,25 +345,27 @@ fn wrap_rows(file: &FileState, width: usize, (left, right): (&mut Vec<Row>, &mut
     sorted.sort_by_key(|block| block.a0);
     for block in sorted.iter().copied().chain([Block { a0: left.len(), a1: left.len(), b0: right.len(), b1: right.len() }]) {
         while a < block.a0 && b < block.b0 {
-            let (l, r) = (parts(left[a], true), parts(right[b], false));
-            let height = l.max(r);
+            let (l, r) = (rows_of(left[a], true), rows_of(right[b], false));
+            let height = l.len().max(r.len());
             left_map.push(new_left.len());
             right_map.push(new_right.len());
-            push(&mut new_left, left[a], l, height);
-            push(&mut new_right, right[b], r, height);
+            push(&mut new_left, l, height);
+            push(&mut new_right, r, height);
             a += 1;
             b += 1;
         }
-        // Each side of a change wraps on its own.
+        // Each side of a change grows on its own.
         for &row in &left[a..block.a1] {
             left_map.push(new_left.len());
-            let count = parts(row, true);
-            push(&mut new_left, row, count, count);
+            let rows = rows_of(row, true);
+            let height = rows.len();
+            push(&mut new_left, rows, height);
         }
         for &row in &right[b..block.b1] {
             right_map.push(new_right.len());
-            let count = parts(row, false);
-            push(&mut new_right, row, count, count);
+            let rows = rows_of(row, false);
+            let height = rows.len();
+            push(&mut new_right, rows, height);
         }
         (a, b) = (block.a1, block.b1);
     }
@@ -529,6 +564,7 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
         match rows.get(at) {
             None | Some(Row::Gap) => clear(buf, row_area, theme.base()),
             Some(&Row::Header(index)) => draw_file_title(buf, row_area, app, index, old_side, app.is_selected(old_side, at)),
+            Some(&Row::Note(index, part)) => draw_note_row(buf, row_area, code_x, app, index, part),
             Some(Row::Fold(_, hidden, _)) => {
                 let style = theme.base().fg(theme.muted()).add_modifier(Modifier::ITALIC);
                 clear(buf, row_area, style);
@@ -605,6 +641,35 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
             }
         }
     }
+}
+
+/// One row of a note: a colored bar, then the note's title, text, reasoning, or reply.
+fn draw_note_row(buf: &mut Buffer, area: Rect, code_x: u16, app: &App, index: usize, part: usize) {
+    let theme = &app.theme;
+    let note = &app.notes[index];
+    let panel = theme.panel();
+    clear(buf, area, panel);
+    // Open notes from the person are yellow, done ones green, and notes from agents magenta.
+    let accent = if note.is_open() {
+        Color::Yellow
+    } else if note.status.as_deref() == Some("done") {
+        Color::Green
+    } else {
+        Color::Magenta
+    };
+    let rows = notes::rows(note, app.note_width);
+    let Some((kind, text)) = rows.get(part) else { return };
+    let style = match kind {
+        notes::Part::Title => panel.fg(accent).add_modifier(Modifier::BOLD),
+        notes::Part::Summary => panel,
+        notes::Part::Rationale => panel.fg(theme.muted()).add_modifier(Modifier::ITALIC),
+        notes::Part::Reply => panel.fg(Color::Green),
+    };
+    let picked = app.picked_note == Some(index);
+    let bar = if picked { "█ " } else { "▌ " };
+    let width = area.width.saturating_sub(code_x - area.x);
+    let line = Line::from(vec![Span::styled(bar, panel.fg(accent)), Span::styled(text.clone(), style)]);
+    buf.set_line(code_x, area.y, &line, width);
 }
 
 /// One side of a file's title row: its path and its line count on that side.
@@ -767,8 +832,19 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     } else {
         side.to_owned()
     };
+    let open = app.notes.iter().filter(|n| n.is_open()).count();
+    let file_part = match (open, app.notes.len()) {
+        (_, 0) => file_part,
+        (0, all) => format!("{file_part} {all} notes  ·"),
+        (open, _) => format!("{file_part} {open} open notes  ·"),
+    };
     let message = match (&app.notice, &app.search) {
         _ if app.copy_menu => Some(" copy:  p path  a absolute path  f file name  l path:line  c change   Esc cancel".to_owned()),
+        _ if app.note_draft.is_some() => app.note_draft.as_ref().map(|d| {
+            let lines = if d.range.0 == d.range.1 { format!("{}", d.range.0) } else { format!("{}-{}", d.range.0, d.range.1) };
+            let side = if d.old_side { " (old side)" } else { "" };
+            format!(" note on {}:{lines}{side}: {}█   Enter save  Esc cancel", d.path, d.text)
+        }),
         (Some(notice), _) => Some(format!(" {notice}")),
         (None, Some(found)) if found.editing => {
             Some(format!(" /{}█   {} matches   Enter done  Esc cancel", found.query, found.matches.len()))
@@ -787,7 +863,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     }
     let context = if app.whole_file { "c: context" } else { "c: whole file" };
     let text = format!(
-        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  z/Z fold  w wrap  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
+        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  a note  }}/{{ notes  z/Z fold  w wrap  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
         app.current_change(),
         app.stream.blocks.len(),
         if app.hscroll > 0 { format!("  ·  col {}", app.hscroll + 1) } else { String::new() },
@@ -796,6 +872,38 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
 }
 
 /// A centered list of files; the selected one is highlighted.
+/// A centered list of every note; the selected one is highlighted.
+fn draw_note_list(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
+    let theme = &app.theme;
+    let width = area.width.saturating_sub(8).min(110).max(20);
+    let height = (app.notes.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let frame = match theme.rgb {
+        Some(_) => theme.panel(),
+        None => Style::default().bg(Color::Black).fg(Color::Reset),
+    };
+    clear(buf, Rect::new(x, y, width, height), frame);
+    let title = format!(" {} notes  (Enter go to, x delete, Esc close)", app.notes.len());
+    buf.set_line(x, y, &Line::styled(title, frame.add_modifier(Modifier::BOLD)), width);
+    let rows = (height - 2) as usize;
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    let placed = app.note_rows();
+    for (row, (index, note)) in app.notes.iter().enumerate().skip(first).take(rows).enumerate() {
+        let style = if index == selected { frame.add_modifier(Modifier::REVERSED) } else { frame };
+        let row_area = Rect::new(x, y + 1 + row as u16, width, 1);
+        clear(buf, row_area, style);
+        let author = note.author.as_deref().unwrap_or("note");
+        let who = note.state().map_or_else(|| author.to_owned(), |state| format!("{author} {state}"));
+        let place = match placed.iter().find(|p| p.note == index) {
+            Some(p) => format!("{}:{}", note.path, p.line + 1),
+            None => format!("{} (not in this diff)", note.path),
+        };
+        let line = format!(" {who:<12} {place}  {}", note.summary.replace('\n', " "));
+        buf.set_line(x, row_area.y, &Line::styled(line, style), width);
+    }
+}
+
 fn draw_picker(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
     let theme = &app.theme;
     let width = area.width.saturating_sub(8).min(100).max(20);
@@ -874,6 +982,30 @@ struct App {
     pending_edit: Option<(PathBuf, usize)>,
     /// The change n/N moved to last, by index.
     picked_change: Option<usize>,
+    /// Notes from the notes file, then from --agent-context.
+    notes: Vec<Note>,
+    notes_file: PathBuf,
+    agent_file: Option<PathBuf>,
+    /// Times and sizes of both files when last read, to read them again when they change.
+    notes_stamp: String,
+    /// Columns for the text of a note.
+    note_width: usize,
+    /// The note `}`/`{` or the list went to last.
+    picked_note: Option<usize>,
+    /// A note being typed.
+    note_draft: Option<Draft>,
+    /// The list of notes, with its selected row.
+    note_list: Option<usize>,
+}
+
+/// A note being typed: where it goes, and its text so far.
+struct Draft {
+    path: String,
+    old_side: bool,
+    /// 1-based, inclusive.
+    range: (usize, usize),
+    anchor: String,
+    text: String,
 }
 
 impl App {
@@ -914,7 +1046,7 @@ impl App {
             })
             .collect();
         (self.max_width, self.number_width) = measure(&self.files);
-        self.stream = Stream::new(&self.files, self.context_lines(), &self.opened, wrap);
+        self.stream = self.build_stream(wrap);
         self.generation += 1;
         self.selection = None;
         self.dragging = false;
@@ -991,7 +1123,7 @@ impl App {
             header @ Row::Header(_) => Some((header, 0, row - right_top)),
             _ => None,
         });
-        self.stream = Stream::new(&self.files, self.context_lines(), &self.opened, wrap);
+        self.stream = self.build_stream(wrap);
         self.generation += 1;
         self.selection = None;
         if let Some((target, part, offset)) = anchor {
@@ -1187,6 +1319,230 @@ impl App {
         }
     }
 
+    fn build_stream(&self, wrap: Option<usize>) -> Stream {
+        Stream::new(&self.files, self.context_lines(), &self.opened, wrap, &self.note_rows())
+    }
+
+    /// Where each note shows: its file in the diff, side, and line. Notes on files that are not
+    /// in the diff are left out (the list still shows them).
+    fn note_rows(&self) -> Vec<NoteRows> {
+        let width = self.note_width.max(20);
+        self.notes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, note)| {
+                let file = self.files.iter().position(|f| *if note.old_side { &f.diff.old_name } else { &f.diff.new_name } == note.path)?;
+                let model = &self.files[file].diff.model;
+                let line = notes::place(note, if note.old_side { &model.old } else { &model.new })?;
+                Some(NoteRows { file, old_side: note.old_side, line, note: index, rows: notes::rows(note, width).len() })
+            })
+            .collect()
+    }
+
+    fn notes_stamp(&self) -> String {
+        let agent = self.agent_file.as_deref().map(crate::git::stamp).unwrap_or_default();
+        format!("{}|{agent}", crate::git::stamp(&self.notes_file))
+    }
+
+    /// Read both notes files. A file that can't be read keeps the notes on screen and says why.
+    fn load_notes(&mut self) {
+        self.notes_stamp = self.notes_stamp();
+        let mut loaded = match notes::load(&self.notes_file, true) {
+            Ok(notes) => notes,
+            Err(error) => {
+                self.notice = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        if let Some(agent) = &self.agent_file {
+            match notes::load(agent, false) {
+                Ok(notes) => loaded.extend(notes),
+                Err(error) => self.notice = Some(format!("{error:#}")),
+            }
+        }
+        self.notes = loaded;
+        self.picked_note = self.picked_note.filter(|&n| n < self.notes.len());
+    }
+
+    /// Read the notes again when a notes file changed. Returns true when it did.
+    fn refresh_notes(&mut self) -> bool {
+        if self.notes_stamp() == self.notes_stamp {
+            return false;
+        }
+        self.load_notes();
+        self.rebuild(self.stream.wrap);
+        true
+    }
+
+    /// The side and stream row where a note starts.
+    fn note_row(&self, note: usize) -> Option<(bool, usize)> {
+        [true, false].into_iter().find_map(|old_side| self.rows(old_side).iter().position(|r| *r == Row::Note(note, 0)).map(|row| (old_side, row)))
+    }
+
+    fn note_on_screen(&self, note: usize) -> bool {
+        let Some((old_side, row)) = self.note_row(note) else { return false };
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let top = if old_side { left_top } else { right_top };
+        row >= top && row < top + self.body_rows
+    }
+
+    /// Scroll to a note, showing its line above it. A note on the hidden side shows both sides.
+    fn go_to_note(&mut self, note: usize) {
+        let Some((old_side, row)) = self.note_row(note) else {
+            self.notice = Some(format!("{} is not in this diff", self.notes[note].path));
+            return;
+        };
+        if (old_side && self.panes == Panes::New) || (!old_side && self.panes == Panes::Old) {
+            self.panes = Panes::Both;
+        }
+        self.picked_note = Some(note);
+        self.position = self.stream.scroll.position_of_row(row, old_side).saturating_sub(CONTEXT_ABOVE_CHANGE + 1);
+    }
+
+    /// `}` and `{`: the next or previous note in the stream.
+    fn step_note(&mut self, forward: bool) {
+        let mut order: Vec<(usize, usize)> = (0..self.notes.len())
+            .filter_map(|n| self.note_row(n).map(|(old_side, row)| (self.stream.scroll.position_of_row(row, old_side), n)))
+            .collect();
+        order.sort();
+        if order.is_empty() {
+            self.notice = Some("no notes (a adds one)".into());
+            return;
+        }
+        let here = self.picked_note.filter(|&n| self.note_on_screen(n)).and_then(|n| order.iter().position(|&(_, m)| m == n));
+        let index = match (here, forward) {
+            (Some(i), true) => (i + 1 < order.len()).then_some(i + 1),
+            (Some(i), false) => i.checked_sub(1),
+            (None, true) => order.iter().position(|&(p, _)| p > self.position),
+            (None, false) => order.iter().rposition(|&(p, _)| p <= self.position),
+        };
+        match index {
+            Some(i) => self.go_to_note(order[i].1),
+            None => self.notice = Some(if forward { "no more notes below" } else { "no more notes above" }.into()),
+        }
+    }
+
+    /// The note `x` deletes: the one picked last, while it is on screen.
+    fn delete_note(&mut self, note: usize) {
+        let Some(found) = self.notes.get(note) else { return };
+        let (true, Some(id)) = (found.editable, found.id.clone()) else {
+            self.notice = Some("notes from --agent-context can't be deleted".into());
+            return;
+        };
+        match notes::remove(&self.notes_file, &id) {
+            Ok(()) => {
+                self.notice = Some("note deleted".into());
+                self.picked_note = None;
+                self.load_notes();
+                self.rebuild(self.stream.wrap);
+            }
+            Err(error) => self.notice = Some(format!("{error:#}")),
+        }
+    }
+
+    /// `a`: start a note on the selected lines, or on the line `e` would open.
+    fn start_note(&mut self) {
+        let place = match self.selection {
+            Some(selection) => {
+                let (start, end) = selection.bounds();
+                let lines: Vec<(usize, usize)> = (start.0..=end.0).filter_map(|row| self.line_of(selection.old_side, row).map(|(f, l, _)| (f, l))).collect();
+                lines.last().map(|&(file, last)| {
+                    let first = lines.iter().find(|&&(f, _)| f == file).map_or(last, |&(_, l)| l);
+                    (file, selection.old_side, first, last)
+                })
+            }
+            None => self.focus().map(|(file, line)| (file, false, line, line)),
+        };
+        let Some((file, old_side, first, last)) = place else {
+            self.notice = Some("select lines, or scroll to a change, to add a note".into());
+            return;
+        };
+        let diff = &self.files[file].diff;
+        let lines = if old_side { &diff.model.old } else { &diff.model.new };
+        let Some(anchor) = lines.get(last).cloned() else {
+            self.notice = Some("no line here for a note".into());
+            return;
+        };
+        let path = if old_side { diff.old_name.clone() } else { diff.new_name.clone() };
+        self.note_draft = Some(Draft { path, old_side, range: (first + 1, last + 1), anchor, text: String::new() });
+        // Plain keys while typing: the Kitty keyboard protocol can split composed characters.
+        let _ = io::stdout().write_all(KEYS_OFF.as_bytes());
+    }
+
+    /// Typing a note.
+    fn apply_draft_key(&mut self, key: &KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let Some(draft) = &mut self.note_draft else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Char('c') if ctrl => {}
+            KeyCode::Enter if draft.text.trim().is_empty() => {}
+            KeyCode::Enter => {
+                let note = Note {
+                    id: Some(notes::new_id()),
+                    path: draft.path.clone(),
+                    old_side: draft.old_side,
+                    range: draft.range,
+                    anchor: Some(draft.anchor.clone()),
+                    summary: draft.text.trim().to_owned(),
+                    rationale: None,
+                    author: Some("you".into()),
+                    status: Some("open".into()),
+                    reply: None,
+                    editable: true,
+                };
+                match notes::add(&self.notes_file, &note) {
+                    Ok(()) => {
+                        self.notice = Some(format!("note saved in {}", self.notes_file.display()));
+                        self.selection = None;
+                        self.load_notes();
+                        self.rebuild(self.stream.wrap);
+                        self.picked_note = self.notes.iter().position(|n| n.id == note.id);
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("{error:#}"));
+                        return;
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                draft.text.pop();
+                return;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                draft.text.push(c);
+                return;
+            }
+            _ => return,
+        }
+        self.note_draft = None;
+        let _ = io::stdout().write_all(KEYS_ON.as_bytes());
+    }
+
+    fn apply_note_list(&mut self, key: &KeyEvent, selected: usize) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let last = self.notes.len().saturating_sub(1);
+        self.note_list = match key.code {
+            KeyCode::Esc | KeyCode::Char('A') | KeyCode::Char('q') => None,
+            KeyCode::Enter => {
+                self.go_to_note(selected);
+                None
+            }
+            KeyCode::Char('x') => {
+                self.delete_note(selected);
+                (!self.notes.is_empty()).then(|| selected.min(self.notes.len() - 1))
+            }
+            KeyCode::Char('j') | KeyCode::Down => Some((selected + 1).min(last)),
+            KeyCode::Char('k') | KeyCode::Up => Some(selected.saturating_sub(1)),
+            _ => Some(selected),
+        };
+    }
+
     fn numbers_right(&self, old_side: bool) -> bool {
         old_side && self.panes == Panes::Both
     }
@@ -1282,7 +1638,7 @@ impl App {
         // Changes-only view starts again with every fold closed.
         self.opened.clear();
         let had_search = self.search.is_some();
-        self.stream = Stream::new(&self.files, self.context_lines(), &self.opened, self.stream.wrap);
+        self.stream = self.build_stream(self.stream.wrap);
         self.generation += 1;
         let starts = self.stream.change_starts();
         // Stay on the same change, or on the same file when it has none above the view.
@@ -1313,6 +1669,16 @@ impl App {
                 self.apply_copy_menu(key);
                 return None;
             }
+        }
+        if let (Some(selected), Event::Key(key)) = (self.note_list, event) {
+            self.apply_note_list(key, selected);
+            return None;
+        }
+        if self.note_draft.is_some() {
+            if let Event::Key(key) = event {
+                self.apply_draft_key(key);
+            }
+            return None;
         }
         if self.search.as_ref().is_some_and(|s| s.editing) {
             if let Event::Key(key) = event {
@@ -1380,6 +1746,33 @@ impl App {
                     }
                     KeyCode::Char('e') => {
                         self.request_edit();
+                        position
+                    }
+                    KeyCode::Char('a') => {
+                        self.start_note();
+                        position
+                    }
+                    KeyCode::Char('}') => {
+                        self.step_note(true);
+                        self.position
+                    }
+                    KeyCode::Char('{') => {
+                        self.step_note(false);
+                        self.position
+                    }
+                    KeyCode::Char('x') => {
+                        match self.picked_note.filter(|&n| self.note_on_screen(n)) {
+                            Some(note) => self.delete_note(note),
+                            None => self.notice = Some("go to a note with } or { first".into()),
+                        }
+                        self.position
+                    }
+                    KeyCode::Char('A') => {
+                        if self.notes.is_empty() {
+                            self.notice = Some("no notes (a adds one)".into());
+                        } else {
+                            self.note_list = Some(self.picked_note.unwrap_or(0));
+                        }
                         position
                     }
                     KeyCode::Char('z') => {
@@ -1805,7 +2198,7 @@ pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> 
 fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, terminal_colors: TermColors) -> anyhow::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
-    let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None);
+    let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None, &[]);
     let mut highlights = spawn_highlighting(&files, &settings.highlighter);
     let (max_width, number_width) = measure(&files);
     let mut app = App {
@@ -1833,10 +2226,20 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         copy_menu: false,
         pending_edit: None,
         picked_change: None,
+        notes: Vec::new(),
+        notes_file: settings.notes_file.clone(),
+        agent_file: settings.agent_context.clone(),
+        notes_stamp: String::new(),
+        note_width: 0,
+        picked_note: None,
+        note_draft: None,
+        note_list: None,
     };
+    app.load_notes();
     // The view opens on the first change.
     app.picked_change = (!app.stream.blocks.is_empty()).then_some(0);
     let mut last_image: Option<(bool, usize, View)> = None;
+    let mut notes_checked = std::time::Instant::now();
 
     loop {
         let size = term.size()?;
@@ -1844,17 +2247,22 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         let parts = layout(area, app.panes);
         let body_rows = parts.left.height as usize;
         // Wrapping follows the width of the code on screen; both sides wrap at the same width.
-        let wrap_width = app.wrap.then(|| {
+        let columns = {
             let width = |side: Rect, old_side: bool| code_area(side, app.number_width, app.numbers_right(old_side)).1 as usize;
             match app.panes {
                 Panes::Both => width(parts.left, true).min(width(parts.right, false)),
                 Panes::Old => width(parts.left, true),
                 Panes::New => width(parts.right, false),
             }
-        });
-        if wrap_width != app.stream.wrap {
+        };
+        let wrap_width = app.wrap.then_some(columns);
+        // Notes wrap at the width of the code, after their two-column bar.
+        let note_width = columns.saturating_sub(2);
+        if wrap_width != app.stream.wrap || (note_width != app.note_width && !app.notes.is_empty()) {
+            app.note_width = note_width;
             app.rebuild(wrap_width);
         }
+        app.note_width = note_width;
         let max = app.stream.scroll.max_position(body_rows);
         app.position = app.position.min(max);
         let (left_top, right_top) = app.stream.scroll.tops(app.position);
@@ -1879,14 +2287,17 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
             }
             draw_ribbons(buf, parts.ribbons, &app.stream.blocks, view, graphics, &app.theme);
             draw_status(buf, parts.status, &app, file);
+            if let Some(selected) = app.note_list {
+                draw_note_list(buf, area, &app, selected);
+            }
             if let Some(selected) = app.picker {
                 draw_picker(buf, area, &app, selected);
             }
         })?;
 
         if graphics == Graphics::Kitty {
-            // The picker covers the ribbon column, so the image comes down while it is open.
-            let wanted = app.picker.is_none().then_some((app.whole_file, app.generation, view));
+            // The lists cover the ribbon column, so the image comes down while one is open.
+            let wanted = (app.picker.is_none() && app.note_list.is_none()).then_some((app.whole_file, app.generation, view));
             if wanted != last_image {
                 let backend = term.backend_mut();
                 match wanted {
@@ -1906,6 +2317,13 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         // drawing again, so a wheel burst draws once.
         let mut next = None;
         while next.is_none() {
+            // Claude, or a person in another terminal, can change the notes file at any time.
+            if notes_checked.elapsed() >= Duration::from_secs(1) {
+                notes_checked = std::time::Instant::now();
+                if app.refresh_notes() {
+                    break;
+                }
+            }
             if event::poll(Duration::from_millis(50))? {
                 next = Some(event::read()?);
             } else if let Ok(done) = highlights.try_recv() {
@@ -1980,7 +2398,7 @@ mod tests {
         let old = format!("a\n{long}\nb\nc\nd\n");
         let new = format!("a\n{long}\nb\nCHANGED {long}\nd\n");
         let files = vec![file("a.ts", &old, &new)];
-        let stream = Stream::new(&files, None, &HashSet::new(), Some(10));
+        let stream = Stream::new(&files, None, &HashSet::new(), Some(10), &[]);
         // Header, a, the long line in 3 rows, b, then the change: "c" (1 row) vs 4 rows.
         assert_eq!(stream.right[2..6], [Row::Line(0, 1), Row::Wrap(0, 1, 1), Row::Wrap(0, 1, 2), Row::Line(0, 2)]);
         assert_eq!(stream.left[2..6], stream.right[2..6]);
@@ -1992,6 +2410,29 @@ mod tests {
     }
 
     #[test]
+    fn notes_keep_both_sides_level_and_open_their_fold() {
+        let numbers = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
+        let files = vec![file("a.ts", &numbers(30), &numbers(30).replace("\n20\n", "\ntwenty\n"))];
+        let note = |line: usize, old_side: bool, note: usize, rows: usize| NoteRows { file: 0, old_side, line, note, rows };
+        // A note outside changes on the new side (line 5, inside the first fold), and one on
+        // the old side of the change (line 20).
+        let notes = [note(4, false, 0, 2), note(19, true, 1, 3)];
+        let stream = Stream::new(&files, Some(3), &HashSet::new(), None, &notes);
+        let at = |rows: &[Row], r: Row| rows.iter().position(|x| *x == r).unwrap();
+        let (left, right) = (&stream.left, &stream.right);
+        assert_eq!(&right[at(right, Row::Line(0, 4)) + 1..][..2], [Row::Note(0, 0), Row::Note(0, 1)]);
+        // The other side gets blank rows, so line 6 stays level.
+        assert_eq!(at(left, Row::Line(0, 5)), at(right, Row::Line(0, 5)));
+        assert_eq!(&left[at(left, Row::Line(0, 19)) + 1..][..3], [Row::Note(1, 0), Row::Note(1, 1), Row::Note(1, 2)]);
+        // Inside the change only the old side grows, and the line after it is level by scrolling.
+        let block = stream.blocks[0];
+        assert_eq!((block.a1 - block.a0, block.b1 - block.b0), (4, 1));
+        let next = |rows: &[Row]| at(rows, Row::Line(0, 20));
+        let (l, r) = stream.scroll.tops(stream.scroll.position_of_row(next(right), false));
+        assert_eq!((l, r), (next(left), next(right)));
+    }
+
+    #[test]
     fn both_sides_reach_each_file_header_together() {
         let numbers = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
         let files = vec![
@@ -1999,7 +2440,7 @@ mod tests {
             file("a.ts", &numbers(20), &numbers(20).replace("\n18\n", "\n18\nx\ny\nz\nw\n")),
             file("b.ts", &numbers(30), &numbers(30).replace("\n5\n", "\nfive\n")),
         ];
-        let stream = Stream::new(&files, Some(3), &HashSet::new(), None);
+        let stream = Stream::new(&files, Some(3), &HashSet::new(), None, &[]);
         for (index, &row) in stream.headers.iter().enumerate() {
             let (left, right) = stream.scroll.tops(stream.header_position(index));
             assert_eq!(stream.left[left], Row::Header(index));
