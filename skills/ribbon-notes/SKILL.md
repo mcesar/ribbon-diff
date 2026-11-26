@@ -83,7 +83,9 @@ reply. Skip changes too small to need a reason, such as a typo fix.
 ```
 
 - Use `"author": "claude"` and leave out `status`: these are not tasks.
-- Put the range on the new lines of your change. For code you only removed, use `oldRange`.
+- Put the range only on lines your change added or changed, as the diff shows them. Don't stretch
+  it over a whole function when you changed part of it. For code you only removed, use
+  `oldRange`.
 - When you change the same lines again, replace your earlier note on them instead of adding a
   second one. You may change or remove your own notes; never the person's.
 - Give each one a unique `id`, and the text of the range's last line as `anchor`.
