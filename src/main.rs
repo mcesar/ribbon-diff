@@ -14,6 +14,7 @@ mod ribbons;
 mod highlight;
 mod imports;
 mod model;
+mod patch;
 mod search;
 mod select;
 mod termcolors;
@@ -26,7 +27,7 @@ use similar::TextDiff;
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use ui::{FileDiff, Graphics, Outcome, Settings};
@@ -37,6 +38,11 @@ ribbon - side-by-side diff with IntelliJ-style ribbons (Kitty graphics)
 USAGE:
     ribbon [OPTIONS] [GIT-DIFF-ARGS...]   changes from git, like `git diff` (the default)
     ribbon [OPTIONS] OLD NEW              two files, or two folders (git difftool --dir-diff)
+    ribbon show [COMMIT] [-- PATHS]       one commit, like `git show` (default: HEAD)
+    ribbon stash [STASH] [-- PATHS]       one stash, like `git stash show -p`
+    ribbon FILE.patch | ribbon -          a patch file, or a patch on stdin:
+                                          git show | ribbon, or as git's pager:
+                                          git config pager.diff ribbon
     ribbon PATH OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE [NEW-PATH INFO]
                                           (as GIT_EXTERNAL_DIFF)
 
@@ -69,9 +75,14 @@ KEYS:
     h/l, H/L, 0         scroll sideways
     n/N                 next/prev change         ]/[      next/prev file
     f, Tab              file list                c        whole file / changes only
+    z, click a fold     show the hidden lines    Z        fold them again
+    w                   wrap long lines
     g/G                 top/end                  q        quit
     < / >               old side / new side alone (again: both)
     /                   search (then n/N)        drag, y  select and copy
+    e                   open in $EDITOR at the selected or first changed line
+    y (no selection)    copy: p path, a absolute path, f file name, l path:line, c change
+    Y                   copy the change as a patch (one side alone: its lines)
 ";
 
 #[derive(Clone)]
@@ -86,6 +97,8 @@ struct Options {
     theme: String,
     context: usize,
     positional: Vec<String>,
+    /// A patch to show instead of asking git (from stdin, a .patch file, or as a pager).
+    patch: Option<String>,
 }
 
 fn parse_args() -> anyhow::Result<Option<Options>> {
@@ -100,6 +113,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         theme: highlight::DEFAULT_THEME.into(),
         context: 3,
         positional: Vec::new(),
+        patch: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -196,6 +210,8 @@ struct Pair {
     new_name: String,
     old: Vec<u8>,
     new: Vec<u8>,
+    /// The new side on disk, for the editor.
+    path: Option<PathBuf>,
 }
 
 /// Every file under a directory, relative to it. Follows symlinks: git difftool --dir-diff
@@ -228,6 +244,7 @@ fn read_dirs(old_root: &Path, new_root: &Path) -> anyhow::Result<Vec<Pair>> {
         .map(|name| Pair {
             old: read_or_empty(old_root, &name),
             new: read_or_empty(new_root, &name),
+            path: Some(new_root.join(&name)).filter(|p| p.is_file()),
             old_name: name.clone(),
             new_name: name,
         })
@@ -244,6 +261,8 @@ fn plain_diff(out: &mut impl Write, pair: &Pair) -> std::io::Result<()> {
 
 /// Where the files come from.
 enum Source {
+    /// A patch, read before anything else.
+    Patch,
     /// Called by git as GIT_EXTERNAL_DIFF: 1, 7, or 9 arguments for one path.
     External,
     /// Two existing files or folders.
@@ -252,7 +271,11 @@ enum Source {
     Git,
 }
 
-fn source(positional: &[String]) -> Source {
+fn source(options: &Options) -> Source {
+    if options.patch.is_some() {
+        return Source::Patch;
+    }
+    let positional = &options.positional;
     let external = std::env::var_os("GIT_DIFF_PATH_COUNTER").is_some() || std::env::var_os("GIT_DIFF_PATH_TOTAL").is_some();
     if external && matches!(positional.len(), 1 | 7 | 9) {
         return Source::External;
@@ -265,19 +288,22 @@ fn source(positional: &[String]) -> Source {
 
 fn read_pairs(options: &Options) -> anyhow::Result<Vec<Pair>> {
     let p = &options.positional;
-    Ok(match source(p) {
+    // As GIT_EXTERNAL_DIFF, git runs us at the top of the work tree.
+    let in_tree = |name: &String| Some(PathBuf::from(name)).filter(|p| p.is_file());
+    Ok(match source(options) {
+        Source::Patch => patch_pairs(options.patch.as_deref().unwrap_or("")),
         Source::External => match p.len() {
             1 => {
                 println!("* Unmerged path {}", p[0]);
                 Vec::new()
             }
-            7 => vec![Pair { old_name: p[0].clone(), new_name: p[0].clone(), old: read(&p[1])?, new: read(&p[4])? }],
-            _ => vec![Pair { old_name: p[0].clone(), new_name: p[7].clone(), old: read(&p[1])?, new: read(&p[4])? }],
+            7 => vec![Pair { old_name: p[0].clone(), new_name: p[0].clone(), old: read(&p[1])?, new: read(&p[4])?, path: in_tree(&p[0]) }],
+            _ => vec![Pair { old_name: p[0].clone(), new_name: p[7].clone(), old: read(&p[1])?, new: read(&p[4])?, path: in_tree(&p[7]) }],
         },
         Source::Paths if Path::new(&p[0]).is_dir() => read_dirs(Path::new(&p[0]), Path::new(&p[1]))?,
         Source::Paths => {
             let name = |path: &String| options.name.clone().unwrap_or_else(|| path.clone());
-            vec![Pair { old_name: name(&p[0]), new_name: name(&p[1]), old: read(&p[0])?, new: read(&p[1])? }]
+            vec![Pair { old_name: name(&p[0]), new_name: name(&p[1]), old: read(&p[0])?, new: read(&p[1])?, path: Some(PathBuf::from(&p[1])) }]
         }
         Source::Git => {
             let mut changes = git::changes(p)?;
@@ -285,9 +311,91 @@ fn read_pairs(options: &Options) -> anyhow::Result<Vec<Pair>> {
                 changes.extend(git::untracked(p)?);
                 changes.sort_by(|a, b| a.new_name.cmp(&b.new_name));
             }
-            changes.into_iter().map(|c| Pair { old_name: c.old_name, new_name: c.new_name, old: c.old, new: c.new }).collect()
+            changes.into_iter().map(|c| Pair { old_name: c.old_name, new_name: c.new_name, old: c.old, new: c.new, path: c.path }).collect()
         }
     })
+}
+
+/// Both sides of each file in a patch. Full files come from git when its `index` lines name
+/// objects git has; the new side can also be the working-tree file, when it hashes the same.
+/// Otherwise both sides are built from the patch.
+fn patch_pairs(text: &str) -> Vec<Pair> {
+    let files: Vec<patch::FilePatch> = patch::parse(text).into_iter().filter(|f| !f.binary).collect();
+    let root = git::top_level().ok();
+    let ids: Vec<String> = files.iter().flat_map(|f| [f.old_id.clone(), f.new_id.clone()]).flatten().collect();
+    let blobs = if root.is_some() { git::read_blobs(ids).unwrap_or_default() } else { Default::default() };
+    let on_disk = |name: &str| Some(root.clone().unwrap_or_default().join(name)).filter(|p| p.is_file());
+    files
+        .into_iter()
+        .map(|f| {
+            let blob = |id: &Option<String>| id.as_ref().and_then(|id| blobs.get(id).cloned());
+            let old = if f.old_missing { Some(Vec::new()) } else { blob(&f.old_id) };
+            let path = on_disk(&f.new_name);
+            let new = if f.new_missing {
+                Some(Vec::new())
+            } else {
+                blob(&f.new_id).or_else(|| {
+                    let (id, path) = (f.new_id.as_ref()?, path.as_ref()?);
+                    let hashed = std::process::Command::new("git").arg("hash-object").arg(path).output().ok()?;
+                    String::from_utf8_lossy(&hashed.stdout).starts_with(id.as_str()).then(|| std::fs::read(path).ok()).flatten()
+                })
+            };
+            let (old, new) = match (old, new) {
+                (Some(old), Some(new)) => (old, new),
+                _ => {
+                    let (old, new) = f.sides();
+                    (old.into_bytes(), new.into_bytes())
+                }
+            };
+            Pair { old_name: f.old_name, new_name: f.new_name, old, new, path }
+        })
+        .collect()
+}
+
+/// A patch to read, if the arguments or stdin give one: `-` or nothing with a pipe or file on
+/// stdin, or one `.patch` or `.diff` file.
+fn read_patch(positional: &[String]) -> anyhow::Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::FileTypeExt;
+    let from_stdin = match positional {
+        [dash] if dash == "-" => true,
+        // Only a pipe or a file: a terminal, /dev/null, or a closed stdin is not a patch.
+        [] => std::fs::metadata("/dev/stdin").is_ok_and(|m| m.file_type().is_fifo() || m.is_file()),
+        [path] if (path.ends_with(".patch") || path.ends_with(".diff")) && Path::new(path).is_file() => {
+            return Ok(Some(String::from_utf8_lossy(&read(path)?).into_owned()));
+        }
+        _ => false,
+    };
+    if !from_stdin {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes)?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// `ribbon show [COMMIT]` and `ribbon stash [STASH]`: the git diff arguments for them, and a
+/// line about the commit for the status line.
+fn subcommand(positional: &[String]) -> Option<(Vec<String>, Option<String>)> {
+    let command = positional.first()?;
+    if command != "show" && command != "stash" {
+        return None;
+    }
+    let rest = &positional[1..];
+    let (revision, rest) = match rest.first() {
+        Some(first) if !first.starts_with('-') => (first.clone(), &rest[1..]),
+        _ => (if command == "show" { "HEAD".to_owned() } else { "stash@{0}".to_owned() }, rest),
+    };
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    // A root commit has no parent: compare with the empty tree.
+    let parent = format!("{revision}^");
+    let base = if git(&["rev-parse", "--verify", "--quiet", &parent]).is_some() { parent } else { "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned() };
+    let notice = git(&["log", "-1", "--format=%h %s", &revision]);
+    let mut args = vec![base, revision];
+    args.extend(rest.iter().cloned());
+    Some((args, notice))
 }
 
 /// True when an argument after `--` names a commit rather than a path that exists.
@@ -380,15 +488,15 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 }
 
 fn file_diffs(diffs: Vec<(Pair, Model)>) -> Vec<FileDiff> {
-    diffs.into_iter().map(|(pair, model)| FileDiff { old_name: pair.old_name, new_name: pair.new_name, model }).collect()
+    diffs.into_iter().map(|(pair, model)| FileDiff { old_name: pair.old_name, new_name: pair.new_name, model, path: pair.path }).collect()
 }
 
 /// Something that changes when the files to compare change, for `--watch`. None when the
 /// source can't be watched (git's temporary files in external-diff mode).
 fn signature(options: &Options) -> Option<Vec<u8>> {
     let p = &options.positional;
-    match source(p) {
-        Source::External => None,
+    match source(options) {
+        Source::External | Source::Patch => None,
         Source::Git => git::signature(p, options.untracked).ok(),
         Source::Paths => {
             let mut signature = String::new();
@@ -429,11 +537,28 @@ fn spawn_watcher(options: Options, highlighter: Arc<Highlighter>, interval: Dura
 }
 
 fn run() -> anyhow::Result<ExitCode> {
-    let Some(options) = parse_args()? else {
+    let Some(mut options) = parse_args()? else {
         return Ok(ExitCode::SUCCESS);
     };
+    let mut notice = None;
+    if let Some((args, about)) = subcommand(&options.positional) {
+        options.positional = args;
+        notice = about;
+    } else if let Some(text) = read_patch(&options.positional)? {
+        // Nothing to show, for example git's pager after an empty `git diff`.
+        if text.is_empty() {
+            return Ok(ExitCode::SUCCESS);
+        }
+        let text = patch::strip_escapes(&text);
+        if patch::parse(&text).is_empty() {
+            // Not a diff (ribbon as the pager for another git command): show it as it is.
+            print!("{text}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        options.patch = Some(text);
+    }
     let highlighter = Arc::new(Highlighter::new(&options.theme)?);
-    let watch = options.watch.filter(|_| std::io::stdout().is_terminal() && !matches!(source(&options.positional), Source::External));
+    let watch = options.watch.filter(|_| std::io::stdout().is_terminal() && !matches!(source(&options), Source::External | Source::Patch));
     // Take the signature before reading, so a change made while reading is not missed.
     let mut last = watch.and_then(|_| signature(&options));
     let mut diffs = load(&options, &highlighter, true)?;
@@ -452,7 +577,7 @@ fn run() -> anyhow::Result<ExitCode> {
     }
     if diffs.is_empty() {
         // Say so on a terminal; git and pipes expect silence for "no changes".
-        if std::io::stderr().is_terminal() && !matches!(source(&options.positional), Source::External) {
+        if std::io::stderr().is_terminal() && !matches!(source(&options), Source::External | Source::Patch) {
             let hint = match options.positional.iter().position(|a| a == "--") {
                 Some(dash) if options.positional[dash + 1..].iter().any(|a| looks_like_revision(a)) => {
                     " (arguments after -- are paths; put commits before --)"
@@ -475,12 +600,22 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 
     let reloads = watch.map(|interval| spawn_watcher(options.clone(), Arc::clone(&highlighter), interval, last));
+    // After the editor closes, read the files again (a patch or git's temporary files can't be).
+    let load_again: Option<Box<dyn Fn() -> Vec<FileDiff>>> = match source(&options) {
+        Source::Patch | Source::External => None,
+        _ => {
+            let (options, highlighter) = (options.clone(), Arc::clone(&highlighter));
+            Some(Box::new(move || load(&options, &highlighter, false).map(file_diffs).unwrap_or_default()))
+        }
+    };
     let settings = Settings {
         graphics: options.graphics.or_else(auto_graphics),
         kitty_hint: kitty_hint(),
         context: options.context,
         highlighter,
         reloads,
+        load_again,
+        notice,
     };
     let files = file_diffs(diffs);
     Ok(match ui::run(files, settings)? {

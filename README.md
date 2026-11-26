@@ -32,6 +32,20 @@ from git, and shows them all in one view.
   lines alone are shown without highlighting and are not counted; files with only such
   changes drop out.
 
+One commit, one stash, or a patch:
+
+```sh
+ribbon show [COMMIT]                     # like git show (default: HEAD)
+ribbon stash [STASH]                     # like git stash show -p (default: stash@{0})
+git show abc123 | ribbon                 # a patch on stdin (also `ribbon -`)
+ribbon fix.patch                         # a .patch or .diff file
+git config pager.diff ribbon             # git diff opens ribbon (also pager.show)
+```
+
+A patch from git names the file versions on its `index` lines; ribbon reads the full files
+from git when it can, so `c` shows whole files. Otherwise it shows only what the patch has.
+As a pager, input that is not a diff is printed as it is.
+
 Outside git mode:
 
 ```sh
@@ -50,16 +64,22 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `h` / `l`, `H` / `L`, `0`, Shift + wheel | scroll sideways |
 | `space` / `Shift+Space` | page down / up (`Shift+Space` needs the Kitty keyboard protocol: Ghostty, Kitty, WezTerm; `PageUp` works everywhere) |
 | `d` / `u` | half page down / up |
-| `n` / `N` | next / previous change (continues into the next / previous file) |
+| `n` / `N` | next / previous change (continues into the next / previous file); `Y` copies it |
 | `]` / `[` | next / previous file |
 | `/` | search both sides as you type (lowercase ignores case); `Enter` keeps it, `Esc` cancels |
 | `n` / `N` after a search | next / previous match; `Esc` clears the search |
 | `f`, `Tab` | file list |
 | `c` | whole file / changes only |
+| `z`, click a fold | show the lines of one fold (the first one on screen, for `z`) |
+| `Z` | close every opened fold (`c` twice does too) |
+| `w` | wrap long lines / scroll them sideways |
+| `e` | open `$VISUAL` or `$EDITOR` at the line: the start of the selection, or else the first changed line on screen; the view reloads after the editor closes |
 | `<` / `>` | old side alone / new side alone, full width; the same key again shows both |
 | `g` / `G` | top / end |
 | mouse drag | select text on one side and copy it (OSC 52; also `pbcopy` on a local Mac); a file title copies its full path |
 | `y` / `Esc` | copy the selection again / clear it |
+| `y` with no selection | copy: `p` path, `a` absolute path, `f` file name, `l` path:line, `c` the change |
+| `Y` | copy the current change (or the one with the selection) as a patch; with one side alone, that side's lines |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |
 

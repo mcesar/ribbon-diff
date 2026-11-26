@@ -4,6 +4,8 @@ use crate::ribbons::{self, RibbonColors, View};
 use crate::highlight::{Highlighter, Paint, Rgb, Tokens};
 use crate::termcolors::{self, TermColors};
 use crate::model::{Block, BlockKind, Display, Item, Model, ScrollMap};
+use std::collections::HashSet;
+use std::path::PathBuf;
 use crate::search::{self, Match, Search};
 use crate::select::{self, Selection};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -62,6 +64,8 @@ pub struct FileDiff {
     pub old_name: String,
     pub new_name: String,
     pub model: Model,
+    /// The new side on disk, for opening it in an editor. None when there is no such file.
+    pub path: Option<PathBuf>,
 }
 
 pub struct Settings {
@@ -74,6 +78,10 @@ pub struct Settings {
     pub highlighter: Arc<Highlighter>,
     /// With `--watch`: a fresh set of changed files whenever they change on disk.
     pub reloads: Option<mpsc::Receiver<Vec<FileDiff>>>,
+    /// Read the changed files again, after the editor closes (without `--watch`).
+    pub load_again: Option<Box<dyn Fn() -> Vec<FileDiff>>>,
+    /// Shown in the status line at the start, such as the commit for `ribbon show`.
+    pub notice: Option<String>,
 }
 
 /// Color files in stream order on a background thread; each result redraws. Dropping the
@@ -161,8 +169,12 @@ enum Row {
     Header(usize),
     /// A source line: file, zero-based line index.
     Line(usize, usize),
-    /// Hidden unchanged lines.
-    Fold(usize),
+    /// More of a long line, with wrapping on: file, line index, and which screen row of the
+    /// line (1 or more).
+    Wrap(usize, usize, usize),
+    /// Hidden unchanged lines: file, how many, and the first new line hidden (which names the
+    /// fold for opening it).
+    Fold(usize, usize, usize),
     /// Space between two files.
     Gap,
 }
@@ -176,10 +188,14 @@ struct Stream {
     scroll: ScrollMap,
     /// Left row of each file's header.
     headers: Vec<usize>,
+    /// Columns per screen row when long lines wrap.
+    wrap: Option<usize>,
 }
 
 impl Stream {
-    fn new(files: &[FileState], context: Option<usize>) -> Self {
+    /// `opened` holds the folds to show, as (new file name, first new line hidden). With
+    /// `wrap`, long lines take more rows, and the shorter of two level lines gets blank rows.
+    fn new(files: &[FileState], context: Option<usize>, opened: &HashSet<(String, usize)>, wrap: Option<usize>) -> Self {
         let (mut left, mut right, mut headers) = (Vec::new(), Vec::new(), Vec::new());
         let (mut blocks, mut scroll_blocks) = (Vec::new(), Vec::new());
         for (index, file) in files.iter().enumerate() {
@@ -190,15 +206,24 @@ impl Stream {
             headers.push(left.len());
             left.push(Row::Header(index));
             right.push(Row::Header(index));
-            let display = Display::new(&file.diff.model, context);
-            let row = |item: &Item| match *item {
-                Item::Line(line) => Row::Line(index, line),
-                Item::Fold(hidden) => Row::Fold(hidden),
-                Item::Blank => Row::Gap,
+            let name = &file.diff.new_name;
+            let open: HashSet<usize> = opened.iter().filter(|(n, _)| n == name).map(|&(_, start)| start).collect();
+            let display = Display::with_open(&file.diff.model, context, &open);
+            let row = |old_side: bool| {
+                let display = &display;
+                move |(at, item): (usize, &Item)| match *item {
+                    Item::Line(line) => Row::Line(index, line),
+                    Item::Fold(hidden) => {
+                        let fold = display.folds.iter().find(|&&(left, right, _)| at == if old_side { left } else { right });
+                        Row::Fold(index, hidden, fold.map_or(usize::MAX, |&(_, _, start)| start))
+                    }
+                    Item::Blank => Row::Gap,
+                }
             };
-            let mut file_left: Vec<Row> = display.left.iter().map(row).collect();
-            let mut file_right: Vec<Row> = display.right.iter().map(row).collect();
+            let mut file_left: Vec<Row> = display.left.iter().enumerate().map(row(true)).collect();
+            let mut file_right: Vec<Row> = display.right.iter().enumerate().map(row(false)).collect();
             let mut file_scroll_blocks = display.scroll_blocks.clone();
+            let mut file_blocks = display.blocks.clone();
 
             // Pad the shorter side with blank rows right after the file's last change, so both
             // sides end the file on the same row and the next file header lines up. The padding
@@ -214,15 +239,19 @@ impl Stream {
                 }
             }
 
+            if let Some(width) = wrap {
+                wrap_rows(file, width, (&mut file_left, &mut file_right), (&mut file_blocks, &mut file_scroll_blocks));
+            }
+
             let (left_start, right_start) = (left.len(), right.len());
             let shift = |b: &Block| Block { a0: b.a0 + left_start, a1: b.a1 + left_start, b0: b.b0 + right_start, b1: b.b1 + right_start };
-            blocks.extend(display.blocks.iter().map(shift));
+            blocks.extend(file_blocks.iter().map(shift));
             scroll_blocks.extend(file_scroll_blocks.iter().map(shift));
             left.extend(file_left);
             right.extend(file_right);
         }
         let scroll = ScrollMap::new(&scroll_blocks, left.len(), right.len());
-        Stream { left, right, blocks, scroll, headers }
+        Stream { left, right, blocks, scroll, headers, wrap }
     }
 
     /// The file title to pin at the top: the file at the top of the view, unless its own
@@ -253,6 +282,65 @@ impl Stream {
         let (left_top, _) = self.scroll.tops(position);
         self.headers.iter().rposition(|&row| row <= left_top).unwrap_or(0)
     }
+}
+
+/// Give each long line one more row per `width` columns. Outside changes, the rows of the two
+/// sides are level pairs: both get as many rows as the longer of the two, so they stay level
+/// (lines that only look equal, with `-w`, can wrap differently). Blocks move to match.
+fn wrap_rows(file: &FileState, width: usize, (left, right): (&mut Vec<Row>, &mut Vec<Row>), (blocks, scroll_blocks): (&mut [Block], &mut [Block])) {
+    let width = width.max(1);
+    let model = &file.diff.model;
+    let parts = |row: Row, old_side: bool| match row {
+        Row::Line(_, line) => {
+            let text = if old_side { &model.old[line] } else { &model.new[line] };
+            select::line_width(text).div_ceil(width).max(1)
+        }
+        _ => 1,
+    };
+    let push = |out: &mut Vec<Row>, row: Row, count: usize, height: usize| {
+        out.push(row);
+        if let Row::Line(f, line) = row {
+            out.extend((1..count).map(|part| Row::Wrap(f, line, part)));
+        }
+        out.extend(std::iter::repeat_n(Row::Gap, height - count));
+    };
+    let (mut new_left, mut new_right) = (Vec::new(), Vec::new());
+    // Old row -> new row, with one entry past the end.
+    let (mut left_map, mut right_map) = (Vec::new(), Vec::new());
+    let (mut a, mut b) = (0, 0);
+    let mut sorted: Vec<Block> = scroll_blocks.to_vec();
+    sorted.sort_by_key(|block| block.a0);
+    for block in sorted.iter().copied().chain([Block { a0: left.len(), a1: left.len(), b0: right.len(), b1: right.len() }]) {
+        while a < block.a0 && b < block.b0 {
+            let (l, r) = (parts(left[a], true), parts(right[b], false));
+            let height = l.max(r);
+            left_map.push(new_left.len());
+            right_map.push(new_right.len());
+            push(&mut new_left, left[a], l, height);
+            push(&mut new_right, right[b], r, height);
+            a += 1;
+            b += 1;
+        }
+        // Each side of a change wraps on its own.
+        for &row in &left[a..block.a1] {
+            left_map.push(new_left.len());
+            let count = parts(row, true);
+            push(&mut new_left, row, count, count);
+        }
+        for &row in &right[b..block.b1] {
+            right_map.push(new_right.len());
+            let count = parts(row, false);
+            push(&mut new_right, row, count, count);
+        }
+        (a, b) = (block.a1, block.b1);
+    }
+    left_map.push(new_left.len());
+    right_map.push(new_right.len());
+    for block in blocks.iter_mut().chain(scroll_blocks.iter_mut()) {
+        *block = Block { a0: left_map[block.a0], a1: left_map[block.a1], b0: right_map[block.b0], b1: right_map[block.b1] };
+    }
+    *left = new_left;
+    *right = new_right;
 }
 
 fn rgb([r, g, b]: Rgb) -> Color {
@@ -441,13 +529,22 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
         match rows.get(at) {
             None | Some(Row::Gap) => clear(buf, row_area, theme.base()),
             Some(&Row::Header(index)) => draw_file_title(buf, row_area, app, index, old_side, app.is_selected(old_side, at)),
-            Some(Row::Fold(hidden)) => {
+            Some(Row::Fold(_, hidden, _)) => {
                 let style = theme.base().fg(theme.muted()).add_modifier(Modifier::ITALIC);
                 clear(buf, row_area, style);
-                let label = format!("⋯ {hidden} unchanged lines");
+                let label = format!("⋯ {hidden} unchanged lines (z or click to show)");
                 buf.set_line(code_x, y, &Line::styled(label, style), code_width);
             }
-            Some(&Row::Line(file_index, index)) => {
+            Some(&(Row::Line(file_index, index) | Row::Wrap(file_index, index, _))) => {
+                let part = match rows[at] {
+                    Row::Wrap(_, _, part) => part,
+                    _ => 0,
+                };
+                // Wrapped rows show the next slice of the line; otherwise the sideways scroll.
+                let skip = match app.stream.wrap {
+                    Some(width) => part * width,
+                    None => app.hscroll,
+                };
                 let file = &app.files[file_index];
                 let (lines, tokens, kinds, inline) = if old_side {
                     (&file.diff.model.old, &file.old_tokens, &file.old_kinds, &file.diff.model.old_inline)
@@ -471,7 +568,9 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 } else {
                     format!(" {:<width$}", index + 1, width = number_width as usize - 1)
                 };
-                buf.set_line(number_x, y, &Line::styled(number, number_style), number_width);
+                if part == 0 {
+                    buf.set_line(number_x, y, &Line::styled(number, number_style), number_width);
+                }
                 let plain = || vec![(Paint::Plain, lines[index].clone())];
                 let line_tokens = tokens.get(index).cloned().unwrap_or_else(plain);
                 let change = changed.then(|| Change {
@@ -480,27 +579,26 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                     // A whole-line change, or a modified line without word matches, is all changed.
                     whole_line: inline[index].is_empty(),
                 });
-                let spans = skip_columns(styled_tokens(&line_tokens, &inline[index], row_style, change, theme), app.hscroll);
+                let spans = skip_columns(styled_tokens(&line_tokens, &inline[index], row_style, change, theme), skip);
                 buf.set_line(code_x, y, &Line::from(spans), code_width);
                 let line = &lines[index];
                 let code = (code_x, code_width);
                 if let Some(found) = &app.search {
                     let current = found.matches.get(found.current);
                     for bytes in search::find_all(line, &found.query) {
-                        let is_current = current.is_some_and(|m| m.old_side == old_side && m.row == at && m.bytes == bytes);
+                        let is_current = current.is_some_and(|m| m.old_side == old_side && m.row == at - part && m.bytes == bytes);
                         // Yellow like most editors; the current match is orange.
                         let bg = if is_current { Color::Indexed(208) } else { Color::Yellow };
                         let columns = (select::line_width(&line[..bytes.start]), select::line_width(&line[..bytes.end]));
-                        paint_columns(buf, code, y, app.hscroll, columns, |cell| {
+                        paint_columns(buf, code, y, skip, columns, |cell| {
                             cell.set_bg(bg).set_fg(Color::Black);
                         });
                     }
                 }
-                let selected = app.selection.filter(|s| s.old_side == old_side).and_then(|s| s.columns(at));
-                if let Some((from, to)) = selected {
+                if let Some((from, to)) = app.selected_columns(old_side, at) {
                     // Selected text is reversed, up to the end of the line.
                     let columns = (from, to.min(select::line_width(line)));
-                    paint_columns(buf, code, y, app.hscroll, columns, |cell| {
+                    paint_columns(buf, code, y, skip, columns, |cell| {
                         cell.modifier.insert(Modifier::REVERSED);
                     });
                 }
@@ -670,6 +768,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         side.to_owned()
     };
     let message = match (&app.notice, &app.search) {
+        _ if app.copy_menu => Some(" copy:  p path  a absolute path  f file name  l path:line  c change   Esc cancel".to_owned()),
         (Some(notice), _) => Some(format!(" {notice}")),
         (None, Some(found)) if found.editing => {
             Some(format!(" /{}█   {} matches   Enter done  Esc cancel", found.query, found.matches.len()))
@@ -688,7 +787,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     }
     let context = if app.whole_file { "c: context" } else { "c: whole file" };
     let text = format!(
-        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  </> one side  / search  h/l j/k space/S-space g/G scroll  q quit",
+        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  z/Z fold  w wrap  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
         app.current_change(),
         app.stream.blocks.len(),
         if app.hscroll > 0 { format!("  ·  col {}", app.hscroll + 1) } else { String::new() },
@@ -765,6 +864,16 @@ struct App {
     panes: Panes,
     /// Counts reloads, so the ribbon image is drawn again for new changes.
     generation: usize,
+    /// Folds opened with `z` or a click: new file name, first new line hidden.
+    opened: HashSet<(String, usize)>,
+    /// Long lines wrap instead of scrolling sideways.
+    wrap: bool,
+    /// `y` without a selection: the next key picks what to copy.
+    copy_menu: bool,
+    /// A file and line (zero-based) to open in the editor after this event.
+    pending_edit: Option<(PathBuf, usize)>,
+    /// The change n/N moved to last, by index.
+    picked_change: Option<usize>,
 }
 
 impl App {
@@ -773,7 +882,7 @@ impl App {
     /// differently.
     fn reload(&mut self, diffs: Vec<FileDiff>) -> bool {
         if diffs.is_empty() {
-            self.notice = Some("no changes now; still watching".into());
+            self.notice = Some("no changes now".into());
             return false;
         }
         // Where the view is: a file, a new-side line near the top (its index and text), and its
@@ -787,6 +896,7 @@ impl App {
             Row::Header(file) => Some((self.files[file].diff.new_name.clone(), None, row - right_top)),
             _ => None,
         });
+        let wrap = self.stream.wrap;
 
         let mut old_files: Vec<FileState> = std::mem::take(&mut self.files);
         self.files = diffs
@@ -804,10 +914,11 @@ impl App {
             })
             .collect();
         (self.max_width, self.number_width) = measure(&self.files);
-        self.stream = Stream::new(&self.files, (!self.whole_file).then_some(self.context));
+        self.stream = Stream::new(&self.files, self.context_lines(), &self.opened, wrap);
         self.generation += 1;
         self.selection = None;
         self.dragging = false;
+        self.picked_change = None;
         if let Some(selected) = self.picker {
             self.picker = Some(selected.min(self.files.len() - 1));
         }
@@ -836,6 +947,244 @@ impl App {
         }
         self.notice = Some("reloaded".into());
         true
+    }
+
+    /// Unchanged lines shown around changes, or None for whole files.
+    fn context_lines(&self) -> Option<usize> {
+        (!self.whole_file).then_some(self.context)
+    }
+
+    fn rows(&self, old_side: bool) -> &[Row] {
+        if old_side { &self.stream.left } else { &self.stream.right }
+    }
+
+    /// The file and line of a row, and which screen row of a wrapped line it is.
+    fn line_of(&self, old_side: bool, row: usize) -> Option<(usize, usize, usize)> {
+        match self.rows(old_side).get(row)? {
+            &Row::Line(file, line) => Some((file, line, 0)),
+            &Row::Wrap(file, line, part) => Some((file, line, part)),
+            _ => None,
+        }
+    }
+
+    /// The selected text columns of a row's line (whole line, not just the row), end
+    /// excluded, or None when the row is outside the selection.
+    fn selected_columns(&self, old_side: bool, row: usize) -> Option<(usize, usize)> {
+        let selection = self.selection.filter(|s| s.old_side == old_side)?;
+        let (start, end) = selection.bounds();
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let line = |r: usize| self.line_of(old_side, r).map(|(file, line, _)| (file, line));
+        let from = if line(row) == line(start.0) { start.1 } else { 0 };
+        let to = if line(row) == line(end.0) { end.1 + 1 } else { usize::MAX };
+        Some((from, to))
+    }
+
+    /// Build the rows again (after opening a fold or changing the wrap width), keeping the
+    /// same line at the same place on screen.
+    fn rebuild(&mut self, wrap: Option<usize>) {
+        let (_, right_top) = self.stream.scroll.tops(self.position);
+        let anchor = (right_top..self.stream.right.len()).find_map(|row| match self.stream.right[row] {
+            Row::Line(file, line) => Some((Row::Line(file, line), 0, row - right_top)),
+            Row::Wrap(file, line, part) => Some((Row::Line(file, line), part, row - right_top)),
+            header @ Row::Header(_) => Some((header, 0, row - right_top)),
+            _ => None,
+        });
+        self.stream = Stream::new(&self.files, self.context_lines(), &self.opened, wrap);
+        self.generation += 1;
+        self.selection = None;
+        if let Some((target, part, offset)) = anchor {
+            if let Some(row) = self.stream.right.iter().position(|r| *r == target) {
+                // Stay on the same slice of a wrapped line, if it still has that many.
+                let row = (row..row + part + 1).take_while(|&r| r == row || matches!(self.stream.right.get(r), Some(Row::Wrap(..)))).last().unwrap_or(row);
+                self.position = self.stream.scroll.position_of_row(row, false).saturating_sub(offset);
+            }
+        }
+        if self.search.is_some() {
+            self.update_matches();
+            self.current_from(self.position);
+        }
+    }
+
+    /// Show the lines of a fold.
+    fn open_fold(&mut self, file: usize, start: usize) {
+        self.opened.insert((self.files[file].diff.new_name.clone(), start));
+        self.rebuild(self.stream.wrap);
+    }
+
+    /// `z`: open the first fold on screen.
+    fn open_fold_on_screen(&mut self) {
+        let old_side = self.panes == Panes::Old;
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let top = if old_side { left_top } else { right_top };
+        let fold = self.shown_rows(old_side, top, self.body_rows).into_iter().find_map(|row| match self.rows(old_side)[row] {
+            Row::Fold(file, _, start) => Some((file, start)),
+            _ => None,
+        });
+        match fold {
+            Some((file, start)) => self.open_fold(file, start),
+            None => self.notice = Some("no fold on screen (c shows whole files)".into()),
+        }
+    }
+
+    /// The new-side line at, or level with, a row: the row itself on the new side; on the old
+    /// side, the first new line of the same file from the level row down.
+    fn new_line_near(&self, old_side: bool, row: usize) -> Option<(usize, usize)> {
+        let (file, line, _) = self.line_of(old_side, row).or_else(|| match self.rows(old_side).get(row)? {
+            &Row::Header(file) => Some((file, 0, 0)),
+            _ => None,
+        })?;
+        if !old_side {
+            return Some((file, line));
+        }
+        let (_, right_top) = self.stream.scroll.tops(self.stream.scroll.position_of_row(row, true));
+        (right_top..self.stream.right.len()).take(500).find_map(|r| match self.stream.right[r] {
+            Row::Line(f, line) if f == file => Some((f, line)),
+            Row::Header(f) if f != file => Some((file, 0)),
+            _ => None,
+        })
+    }
+
+    /// The line that `e` opens and `y l` copies: the start of the selection, or else the change
+    /// picked with n/N, or else the first changed new line on screen, or else the first new line
+    /// on screen.
+    fn focus(&self) -> Option<(usize, usize)> {
+        if let Some(selection) = self.selection {
+            let (start, _) = selection.bounds();
+            return self.new_line_near(selection.old_side, start.0);
+        }
+        // The change picked with n/N.
+        if let Some(block) = self.picked_change.filter(|&i| self.change_on_screen(i)).and_then(|i| self.stream.blocks.get(i)) {
+            let new_line = (block.b0..block.b1).find_map(|row| self.new_line_near(false, row));
+            if let Some(found) = new_line.or_else(|| self.new_line_near(true, block.a0)) {
+                return Some(found);
+            }
+        }
+        let old_side = self.panes == Panes::Old;
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let top = if old_side { left_top } else { right_top };
+        let shown = self.shown_rows(old_side, top, self.body_rows.max(1));
+        let changed = shown.iter().find(|&&row| {
+            self.line_of(old_side, row).is_some_and(|(file, line, _)| {
+                let state = &self.files[file];
+                (if old_side { &state.old_kinds } else { &state.new_kinds })[line].is_some()
+            })
+        });
+        let any = shown.iter().find(|&&row| self.line_of(old_side, row).is_some());
+        changed.or(any).and_then(|&row| self.new_line_near(old_side, row))
+    }
+
+    /// The change that holds the selection, or else the current one, as a patch. With one
+    /// side alone, that side's lines.
+    fn change_text(&self) -> Option<(String, &'static str)> {
+        let index = match self.selection {
+            Some(selection) => {
+                let row = selection.bounds().0 .0;
+                self.stream.blocks.iter().position(|b| {
+                    let (from, to) = if selection.old_side { (b.a0, b.a1) } else { (b.b0, b.b1) };
+                    (from..to).contains(&row)
+                })
+            }
+            None => None,
+        }
+        .unwrap_or(self.current_change().checked_sub(1)?);
+        let block = *self.stream.blocks.get(index)?;
+        let lines = |old_side: bool, rows: Range<usize>| -> Vec<(usize, usize)> {
+            rows.filter_map(|r| match self.rows(old_side)[r] {
+                Row::Line(file, line) => Some((file, line)),
+                _ => None,
+            })
+            .collect()
+        };
+        let (old, new) = (lines(true, block.a0..block.a1), lines(false, block.b0..block.b1));
+        let file = old.first().or(new.first())?.0;
+        let model = &self.files[file].diff.model;
+        let text = |old_side: bool, lines: &[(usize, usize)]| -> Vec<String> {
+            lines.iter().map(|&(_, l)| if old_side { model.old[l].clone() } else { model.new[l].clone() }).collect()
+        };
+        match self.panes {
+            Panes::Old => return Some((text(true, &old).join("\n"), "old lines")),
+            Panes::New => return Some((text(false, &new).join("\n"), "new lines")),
+            Panes::Both => {}
+        }
+        // Where an empty side sits: after the last line above it on that side.
+        let start = |old_side: bool, lines: &[(usize, usize)], first_row: usize| -> usize {
+            match lines.first() {
+                Some(&(_, line)) => line + 1,
+                None => (0..first_row).rev().find_map(|r| match self.rows(old_side)[r] {
+                    Row::Line(f, line) if f == file => Some(line + 1),
+                    Row::Header(_) => Some(0),
+                    _ => None,
+                }).unwrap_or(0),
+            }
+        };
+        let diff = &self.files[file].diff;
+        let mut patch = format!(
+            "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
+            diff.old_name,
+            diff.new_name,
+            start(true, &old, block.a0),
+            old.len(),
+            start(false, &new, block.b0),
+            new.len()
+        );
+        for line in text(true, &old) {
+            patch.push_str(&format!("-{line}\n"));
+        }
+        for line in text(false, &new) {
+            patch.push_str(&format!("+{line}\n"));
+        }
+        Some((patch, "change"))
+    }
+
+    fn copy_text(&mut self, text: &str, what: &str) {
+        self.notice = Some(match select::copy(text) {
+            Ok(()) if text.lines().count() > 1 => format!("copied {what} ({} lines)", text.lines().count()),
+            Ok(()) => format!("copied {what}: {text}"),
+            Err(error) => format!("copy failed: {error}"),
+        });
+    }
+
+    /// The key after `y` without a selection.
+    fn apply_copy_menu(&mut self, key: &KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        self.copy_menu = false;
+        let focus = self.focus();
+        let file = focus.map_or_else(|| self.current_file(), |(file, _)| file);
+        let Some(state) = self.files.get(file) else { return };
+        let name = state.diff.new_name.clone();
+        let copied = match key.code {
+            KeyCode::Char('p') => Some((name, "path")),
+            KeyCode::Char('a') => {
+                let absolute = state.diff.path.as_ref().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()));
+                Some((absolute.map_or(name, |p| p.display().to_string()), "absolute path"))
+            }
+            KeyCode::Char('f') => {
+                let file_name = std::path::Path::new(&name).file_name().map(|n| n.to_string_lossy().into_owned());
+                Some((file_name.unwrap_or(name), "file name"))
+            }
+            KeyCode::Char('l') => focus.map(|(_, line)| (format!("{name}:{}", line + 1), "path:line")),
+            KeyCode::Char('c') => self.change_text(),
+            _ => None,
+        };
+        if let Some((text, what)) = copied {
+            self.copy_text(&text, what);
+        }
+    }
+
+    /// `e`: open the focus line in the editor, after this event.
+    fn request_edit(&mut self) {
+        let Some((file, line)) = self.focus() else {
+            self.notice = Some("no line to open".into());
+            return;
+        };
+        match self.files[file].diff.path.clone().filter(|p| p.exists()) {
+            Some(path) => self.pending_edit = Some((path, line)),
+            None => self.notice = Some(format!("{} is not a file on disk", self.files[file].diff.new_name)),
+        }
     }
 
     fn numbers_right(&self, old_side: bool) -> bool {
@@ -910,8 +1259,19 @@ impl App {
     /// One-based index of the change at the top of the view. Changes too close to the start
     /// to scroll to count as current from the start.
     fn current_change(&self) -> usize {
+        // n/N pick a change even when the view can't scroll to it (all of it fits on screen).
+        if let Some(index) = self.picked_change.filter(|&i| self.change_on_screen(i)) {
+            return index + 1;
+        }
         let passed = self.stream.change_starts().iter().filter(|&&s| s <= self.position).count();
         if self.stream.blocks.is_empty() { 0 } else { passed.max(1) }
+    }
+
+    fn change_on_screen(&self, index: usize) -> bool {
+        let Some(block) = self.stream.blocks.get(index) else { return false };
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let rows = self.body_rows;
+        (block.a0 < left_top + rows && block.a1.max(block.a0 + 1) > left_top) || (block.b0 < right_top + rows && block.b1.max(block.b0 + 1) > right_top)
     }
 
     fn toggle_whole_file(&mut self) {
@@ -919,8 +1279,11 @@ impl App {
         let file = self.current_file();
         self.whole_file = !self.whole_file;
         self.selection = None;
+        // Changes-only view starts again with every fold closed.
+        self.opened.clear();
         let had_search = self.search.is_some();
-        self.stream = Stream::new(&self.files, (!self.whole_file).then_some(self.context));
+        self.stream = Stream::new(&self.files, self.context_lines(), &self.opened, self.stream.wrap);
+        self.generation += 1;
         let starts = self.stream.change_starts();
         // Stay on the same change, or on the same file when it has none above the view.
         self.position = match starts.get(change.saturating_sub(1)) {
@@ -945,6 +1308,10 @@ impl App {
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Release {
                 self.notice = None;
+            }
+            if self.copy_menu {
+                self.apply_copy_menu(key);
+                return None;
             }
         }
         if self.search.as_ref().is_some_and(|s| s.editing) {
@@ -996,8 +1363,42 @@ impl App {
                         self.selection = None;
                         position
                     }
-                    KeyCode::Char('y') => {
+                    KeyCode::Char('y') if self.selection.is_some() => {
                         self.copy_selection();
+                        position
+                    }
+                    KeyCode::Char('y') => {
+                        self.copy_menu = true;
+                        position
+                    }
+                    KeyCode::Char('Y') => {
+                        match self.change_text() {
+                            Some((text, what)) => self.copy_text(&text, what),
+                            None => self.notice = Some("no change to copy".into()),
+                        }
+                        position
+                    }
+                    KeyCode::Char('e') => {
+                        self.request_edit();
+                        position
+                    }
+                    KeyCode::Char('z') => {
+                        self.open_fold_on_screen();
+                        self.position
+                    }
+                    KeyCode::Char('Z') => {
+                        if self.opened.is_empty() {
+                            self.notice = Some("no opened folds".into());
+                        } else {
+                            self.opened.clear();
+                            self.rebuild(self.stream.wrap);
+                        }
+                        self.position
+                    }
+                    KeyCode::Char('w') => {
+                        // The event loop builds the rows again at the new width.
+                        self.wrap = !self.wrap;
+                        self.hscroll = 0;
                         position
                     }
                     KeyCode::Char('q') | KeyCode::Esc => return Some(Outcome::Quit),
@@ -1025,9 +1426,23 @@ impl App {
                     }
                     KeyCode::Char('g') | KeyCode::Home => 0,
                     KeyCode::Char('G') | KeyCode::End => max,
-                    KeyCode::Char('n') => starts.iter().copied().find(|&s| s > position).unwrap_or(position),
-                    KeyCode::Char('N') | KeyCode::Char('p') => {
-                        starts.iter().copied().rev().find(|&s| s < position).unwrap_or(position)
+                    // Next or previous change from the one picked last, while it is on screen
+                    // (n/N pick a change even when the view can't scroll to it); otherwise from
+                    // the scroll position.
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('p') => {
+                        let picked = self.picked_change.filter(|&i| self.change_on_screen(i));
+                        let index = if key.code == KeyCode::Char('n') {
+                            picked.map_or_else(|| starts.iter().position(|&s| s > position), |i| Some(i + 1)).filter(|&i| i < starts.len())
+                        } else {
+                            picked.map_or_else(|| starts.iter().rposition(|&s| s < position), |i| i.checked_sub(1))
+                        };
+                        match index {
+                            Some(index) => {
+                                self.picked_change = Some(index);
+                                starts[index]
+                            }
+                            None => position,
+                        }
                     }
                     KeyCode::Char(']') if file + 1 < files => self.stream.header_position(file + 1),
                     // [ goes to the top of this file first, then to the previous file.
@@ -1096,12 +1511,17 @@ impl App {
         let Some(m) = self.search.as_ref().and_then(|s| s.matches.get(s.current)).cloned() else { return };
         let (left_top, right_top) = self.stream.scroll.tops(self.position);
         let top = if m.old_side { left_top } else { right_top };
-        // The first row can be under the sticky file title.
-        if m.row <= top || m.row >= top + self.body_rows {
-            self.position = self.stream.scroll.position_of_row(m.row, m.old_side).saturating_sub(CONTEXT_ABOVE_CHANGE);
-        }
         let Some(line) = self.line_at(m.old_side, m.row) else { return };
         let (from, to) = (select::line_width(&line[..m.bytes.start]), select::line_width(&line[..m.bytes.end]));
+        // A wrapped line shows the match on a later row.
+        let row = m.row + self.stream.wrap.map_or(0, |width| from / width.max(1));
+        // The first row can be under the sticky file title.
+        if row <= top || row >= top + self.body_rows {
+            self.position = self.stream.scroll.position_of_row(row, m.old_side).saturating_sub(CONTEXT_ABOVE_CHANGE);
+        }
+        if self.wrap {
+            return;
+        }
         // Prefer the line start; scroll sideways only for a match past the right edge.
         if to <= self.code_width {
             self.hscroll = 0;
@@ -1177,7 +1597,13 @@ impl App {
             return (self.header_row(file, old_side), column + self.hscroll);
         }
         let shown = self.shown_rows(old_side, top, row + 1);
-        (shown.get(row).or(shown.last()).copied().unwrap_or(top), column + self.hscroll)
+        let at = shown.get(row).or(shown.last()).copied().unwrap_or(top);
+        // On a wrapped line, the column counts from the line start.
+        let skip = match self.stream.wrap {
+            Some(width) => self.line_of(old_side, at).map_or(0, |(_, _, part)| part * width),
+            None => self.hscroll,
+        };
+        (at, column + skip)
     }
 
     /// Start, extend, or finish a selection with the left button. Returns true when the event
@@ -1211,6 +1637,13 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
                 match self.selection {
+                    // A click on a fold opens it.
+                    Some(s) if s.anchor == s.head && matches!(self.rows(s.old_side).get(s.anchor.0), Some(Row::Fold(..))) => {
+                        self.selection = None;
+                        if let Some(&Row::Fold(file, _, start)) = self.rows(s.old_side).get(s.anchor.0) {
+                            self.open_fold(file, start);
+                        }
+                    }
                     // A click without a drag only clears the old selection.
                     Some(s) if s.anchor == s.head => self.selection = None,
                     Some(_) => self.copy_selection(),
@@ -1228,12 +1661,15 @@ impl App {
         let rows = if selection.old_side { &self.stream.left } else { &self.stream.right };
         let (start, end) = selection.bounds();
         let mut lines = Vec::new();
+        let mut last_line = None;
         for row in start.0..=end.0 {
             match rows.get(row) {
-                Some(&Row::Line(file, index)) => {
+                // A wrapped line counts once.
+                Some(&(Row::Line(file, index) | Row::Wrap(file, index, _))) if last_line != Some((file, index)) => {
+                    last_line = Some((file, index));
                     let model = &self.files[file].diff.model;
                     let line = if selection.old_side { &model.old[index] } else { &model.new[index] };
-                    let (from, to) = selection.columns(row).unwrap_or((0, 0));
+                    let (from, to) = self.selected_columns(selection.old_side, row).unwrap_or((0, 0));
                     lines.push(select::slice_columns(line, from, to));
                 }
                 Some(&Row::Header(file)) => {
@@ -1261,6 +1697,9 @@ impl App {
 
     /// The new horizontal scroll for a sideways key or wheel event, if it is one.
     fn horizontal(&self, event: &Event) -> Option<usize> {
+        if self.wrap {
+            return None;
+        }
         let (step, half) = (8, (self.code_width / 2).max(1));
         let (now, back) = (self.hscroll, |by: usize| self.hscroll.saturating_sub(by));
         match event {
@@ -1315,6 +1754,33 @@ pub fn restore_terminal(graphics: Graphics) {
     let _ = terminal::disable_raw_mode();
 }
 
+/// Open `path` at zero-based `line` in `$VISUAL` or `$EDITOR` (or vi), with the terminal back
+/// in its normal state until the editor exits.
+fn edit(path: &std::path::Path, line: usize, graphics: Graphics) -> io::Result<()> {
+    let editor = std::env::var("VISUAL").ok().filter(|e| !e.trim().is_empty()).or_else(|| std::env::var("EDITOR").ok()).filter(|e| !e.trim().is_empty());
+    let editor = editor.unwrap_or_else(|| "vi".into());
+    let mut words = editor.split_whitespace();
+    let program = words.next().unwrap_or("vi");
+    let name = std::path::Path::new(program).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let at = format!("{}:{}", path.display(), line + 1);
+    let mut command = std::process::Command::new(program);
+    command.args(words);
+    // Editors that take `file:line`; the rest take `+line file`, like vi, emacs, and nano.
+    match name.as_str() {
+        "code" | "code-insiders" | "cursor" | "windsurf" | "codium" => command.args(["-g", &at]),
+        "zed" | "zeditor" | "subl" | "hx" | "helix" | "mate" => command.arg(&at),
+        _ => command.arg(format!("+{}", line + 1)).arg(path),
+    };
+    restore_terminal(graphics);
+    let status = command.status();
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+    io::stdout().write_all(MOUSE_ON.as_bytes())?;
+    io::stdout().write_all(KEYS_ON.as_bytes())?;
+    io::stdout().flush()?;
+    status.map(|_| ())
+}
+
 pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> {
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
@@ -1339,7 +1805,7 @@ pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> 
 fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, terminal_colors: TermColors) -> anyhow::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
-    let stream = Stream::new(&files, Some(settings.context));
+    let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None);
     let mut highlights = spawn_highlighting(&files, &settings.highlighter);
     let (max_width, number_width) = measure(&files);
     let mut app = App {
@@ -1357,12 +1823,19 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         sides: (Rect::default(), Rect::default()),
         selection: None,
         dragging: false,
-        notice: None,
+        notice: settings.notice.clone(),
         search: None,
         body_rows: 0,
         panes: Panes::Both,
         generation: 0,
+        opened: HashSet::new(),
+        wrap: false,
+        copy_menu: false,
+        pending_edit: None,
+        picked_change: None,
     };
+    // The view opens on the first change.
+    app.picked_change = (!app.stream.blocks.is_empty()).then_some(0);
     let mut last_image: Option<(bool, usize, View)> = None;
 
     loop {
@@ -1370,6 +1843,18 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         let area = Rect::new(0, 0, size.width, size.height);
         let parts = layout(area, app.panes);
         let body_rows = parts.left.height as usize;
+        // Wrapping follows the width of the code on screen; both sides wrap at the same width.
+        let wrap_width = app.wrap.then(|| {
+            let width = |side: Rect, old_side: bool| code_area(side, app.number_width, app.numbers_right(old_side)).1 as usize;
+            match app.panes {
+                Panes::Both => width(parts.left, true).min(width(parts.right, false)),
+                Panes::Old => width(parts.left, true),
+                Panes::New => width(parts.right, false),
+            }
+        });
+        if wrap_width != app.stream.wrap {
+            app.rebuild(wrap_width);
+        }
         let max = app.stream.scroll.max_position(body_rows);
         app.position = app.position.min(max);
         let (left_top, right_top) = app.stream.scroll.tops(app.position);
@@ -1443,6 +1928,26 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
             if let Some(outcome) = app.apply(&current, page, max) {
                 return Ok(outcome);
             }
+            if let Some((path, line)) = app.pending_edit.take() {
+                let edited = edit(&path, line, graphics);
+                // A new terminal draws every cell again. (Terminal::clear asks the terminal for
+                // the cursor position, which can time out.)
+                io::stdout().write_all(b"\x1b[2J")?;
+                term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+                last_image = None;
+                match edited {
+                    Err(error) => app.notice = Some(format!("cannot open the editor: {error}")),
+                    // With --watch, the watcher sees the change; otherwise read the files again.
+                    Ok(()) if settings.reloads.is_none() => {
+                        if let Some(load) = &settings.load_again {
+                            if app.reload(load()) {
+                                highlights = spawn_highlighting(&app.files, &settings.highlighter);
+                            }
+                        }
+                    }
+                    Ok(()) => {}
+                }
+            }
             let max = app.stream.scroll.max_position(body_rows);
             app.position = app.position.min(max);
             next = if event::poll(Duration::ZERO)? { Some(event::read()?) } else { None };
@@ -1455,7 +1960,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str, old: &str, new: &str) -> FileState {
-        FileState::new(FileDiff { old_name: name.into(), new_name: name.into(), model: Model::new(old, new) })
+        FileState::new(FileDiff { old_name: name.into(), new_name: name.into(), model: Model::new(old, new), path: None })
     }
 
     #[test]
@@ -1470,6 +1975,23 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_lines_keep_both_sides_level() {
+        let long = "x".repeat(25);
+        let old = format!("a\n{long}\nb\nc\nd\n");
+        let new = format!("a\n{long}\nb\nCHANGED {long}\nd\n");
+        let files = vec![file("a.ts", &old, &new)];
+        let stream = Stream::new(&files, None, &HashSet::new(), Some(10));
+        // Header, a, the long line in 3 rows, b, then the change: "c" (1 row) vs 4 rows.
+        assert_eq!(stream.right[2..6], [Row::Line(0, 1), Row::Wrap(0, 1, 1), Row::Wrap(0, 1, 2), Row::Line(0, 2)]);
+        assert_eq!(stream.left[2..6], stream.right[2..6]);
+        assert_eq!(stream.blocks[0], Block { a0: 6, a1: 7, b0: 6, b1: 10 });
+        // The line after the change sits level on both sides.
+        let d = |rows: &[Row]| rows.iter().position(|r| *r == Row::Line(0, 4)).unwrap();
+        let (left, right) = stream.scroll.tops(stream.scroll.position_of_row(d(&stream.right), false));
+        assert_eq!((left, right), (d(&stream.left), d(&stream.right)));
+    }
+
+    #[test]
     fn both_sides_reach_each_file_header_together() {
         let numbers = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
         let files = vec![
@@ -1477,7 +1999,7 @@ mod tests {
             file("a.ts", &numbers(20), &numbers(20).replace("\n18\n", "\n18\nx\ny\nz\nw\n")),
             file("b.ts", &numbers(30), &numbers(30).replace("\n5\n", "\nfive\n")),
         ];
-        let stream = Stream::new(&files, Some(3));
+        let stream = Stream::new(&files, Some(3), &HashSet::new(), None);
         for (index, &row) in stream.headers.iter().enumerate() {
             let (left, right) = stream.scroll.tops(stream.header_position(index));
             assert_eq!(stream.left[left], Row::Header(index));

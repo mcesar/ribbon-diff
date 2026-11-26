@@ -14,6 +14,8 @@ pub struct Change {
     pub new_name: String,
     pub old: Vec<u8>,
     pub new: Vec<u8>,
+    /// The new side in the working tree, when it is there.
+    pub path: Option<PathBuf>,
 }
 
 const ZERO: &str = "0000000000000000000000000000000000000000";
@@ -63,7 +65,7 @@ fn parse_raw(raw: &[u8]) -> Vec<Entry> {
 
 /// Read many blobs with one `git cat-file --batch`. A writer thread feeds the ids, so a large
 /// reply can't fill the pipe while ids are still being written.
-fn read_blobs(ids: Vec<String>) -> anyhow::Result<HashMap<String, Vec<u8>>> {
+pub fn read_blobs(ids: Vec<String>) -> anyhow::Result<HashMap<String, Vec<u8>>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -103,7 +105,7 @@ fn raw_diff(args: &[String]) -> anyhow::Result<Vec<u8>> {
     git(&command)
 }
 
-fn top_level() -> anyhow::Result<PathBuf> {
+pub fn top_level() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf8_lossy(&git(&["rev-parse", "--show-toplevel"])?).trim()))
 }
 
@@ -161,6 +163,7 @@ pub fn changes(args: &[String]) -> anyhow::Result<Vec<Change>> {
         .map(|e| Change {
             old: if e.old_id == ZERO { Vec::new() } else { blob(&e.old_id) },
             new: if e.new_id != ZERO { blob(&e.new_id) } else if e.new_mode == "000000" { Vec::new() } else { worktree(&e.new_path) },
+            path: Some(root.join(&e.new_path)).filter(|p| p.is_file()),
             old_name: e.old_path,
             new_name: e.new_path,
         })
@@ -202,7 +205,7 @@ pub fn untracked(args: &[String]) -> anyhow::Result<Vec<Change>> {
         .into_iter()
         .filter_map(|name| {
             let new = std::fs::read(root.join(&name)).ok()?;
-            Some(Change { old_name: name.clone(), new_name: name, old: Vec::new(), new })
+            Some(Change { old_name: name.clone(), new_name: name.clone(), old: Vec::new(), new, path: Some(root.join(name)) })
         })
         .collect())
 }

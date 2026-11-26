@@ -1,6 +1,7 @@
 //! Line diff, change blocks, and the IntelliJ-style scroll mapping between the two sides.
 
 use similar::{Algorithm, ChangeTag, DiffTag, TextDiff};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -270,17 +271,26 @@ pub struct Display {
     /// Every row range where the two sides differ in length (shown and quiet changes), for
     /// the scroll map.
     pub scroll_blocks: Vec<Block>,
+    /// For each fold: its left row, its right row, and the first new line it hides, which
+    /// names the fold for opening it. The rows differ after an opened fold with a quiet change.
+    pub folds: Vec<(usize, usize, usize)>,
 }
 
 /// Unchanged runs this short are shown rather than folded into a one-row marker.
 const MIN_FOLD: usize = 2;
 
 impl Display {
+    #[cfg(test)]
     pub fn new(model: &Model, context: Option<usize>) -> Self {
-        let mut display = Display { left: Vec::new(), right: Vec::new(), blocks: Vec::new(), scroll_blocks: Vec::new() };
+        Display::with_open(model, context, &HashSet::new())
+    }
+
+    /// Like `new`, but the folds that start at a new line in `opened` show their lines.
+    pub fn with_open(model: &Model, context: Option<usize>, opened: &HashSet<usize>) -> Self {
+        let mut display = Display { left: Vec::new(), right: Vec::new(), blocks: Vec::new(), scroll_blocks: Vec::new(), folds: Vec::new() };
         let (mut a, mut b) = (0, 0);
         for (index, block) in model.blocks.iter().enumerate() {
-            display.quiet_region(model, (a, block.a0), (b, block.b0), index > 0, true, context);
+            display.quiet_region(model, (a, block.a0), (b, block.b0), index > 0, true, context, opened);
             let (a0, b0) = (display.left.len(), display.right.len());
             display.left.extend((block.a0..block.a1).map(Item::Line));
             display.right.extend((block.b0..block.b1).map(Item::Line));
@@ -291,7 +301,7 @@ impl Display {
             b = block.b1;
         }
         let has_blocks = !model.blocks.is_empty();
-        display.quiet_region(model, (a, model.old.len()), (b, model.new.len()), has_blocks, false, context);
+        display.quiet_region(model, (a, model.old.len()), (b, model.new.len()), has_blocks, false, context, opened);
         display
     }
 
@@ -320,6 +330,7 @@ impl Display {
         before: bool,
         after: bool,
         context: Option<usize>,
+        opened: &HashSet<usize>,
     ) {
         let (la, lb) = (a_end - a_start, b_end - b_start);
         if let Some(n) = context {
@@ -330,7 +341,7 @@ impl Display {
                     self.left.push(Item::Line(a_start + i));
                     self.right.push(Item::Line(b_start + i));
                 }
-                self.fold_with_context(model, (a_start + head, a_end - tail), (b_start + head, b_end - tail), b_end - tail);
+                self.fold_with_context(model, (a_start + head, a_end - tail), (b_start + head, b_end - tail), b_end - tail, opened);
                 for i in 0..tail {
                     self.left.push(Item::Line(a_end - tail + i));
                     self.right.push(Item::Line(b_end - tail + i));
@@ -338,6 +349,12 @@ impl Display {
                 return;
             }
         }
+        self.unfolded(model, (a_start, a_end), (b_start, b_end));
+    }
+
+    /// Every line of an unchanged stretch, with each quiet change in it as a scroll block so
+    /// the sides stay aligned.
+    fn unfolded(&mut self, model: &Model, (a_start, a_end): (usize, usize), (b_start, b_end): (usize, usize)) {
         let (mut a, mut b) = (a_start, b_start);
         let inside = model.quiet.iter().filter(|q| q.a0 >= a_start && q.a1 <= a_end && q.b0 >= b_start && q.b1 <= b_end);
         for quiet in inside {
@@ -366,7 +383,7 @@ impl Display {
     /// Fold the hidden lines `a0..a1` and `b0..b1`, but show the definitions among them that
     /// hold `next`, the first new line after the fold (its function, class, and so on):
     /// "12 unchanged lines", the function line, "30 unchanged lines".
-    fn fold_with_context(&mut self, model: &Model, (a0, a1): (usize, usize), (b0, b1): (usize, usize), next: usize) {
+    fn fold_with_context(&mut self, model: &Model, (a0, a1): (usize, usize), (b0, b1): (usize, usize), next: usize, opened: &HashSet<usize>) {
         let openers = if next < model.new.len() { crate::context::definitions(&model.new, next) } else { Vec::new() };
         let mut shown: Vec<(usize, usize)> =
             openers.into_iter().filter(|&b| b >= b0 && b < b1).filter_map(|b| Some((old_line(model, (a0, b0), b)?, b))).collect();
@@ -381,7 +398,9 @@ impl Display {
                     self.left.push(Item::Line(a));
                     self.right.push(Item::Line(b));
                 }
+                _ if opened.contains(&b) => self.unfolded(model, (a, line_a), (b, line_b)),
                 (hidden_a, hidden_b) => {
+                    self.folds.push((self.left.len(), self.right.len(), b));
                     self.left.push(Item::Fold(hidden_a));
                     self.right.push(Item::Fold(hidden_b));
                 }
@@ -635,6 +654,18 @@ mod tests {
     fn no_word_marks_when_most_of_the_line_changed() {
         let (old, new) = inline_changes("expect(a).toBe(1)", "// a comment about something else");
         assert!(old.is_empty() && new.is_empty());
+    }
+
+    #[test]
+    fn an_opened_fold_shows_its_lines() {
+        let numbers = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
+        let m = model(&numbers(30), &numbers(30).replace("\n15\n", "\nfifteen\n"));
+        let folded = Display::new(&m, Some(2));
+        assert_eq!(folded.folds, vec![(0, 0, 0), (6, 6, 17)]);
+        let opened = Display::with_open(&m, Some(2), &HashSet::from([17]));
+        assert_eq!(opened.folds, vec![(0, 0, 0)]);
+        assert_eq!(opened.right.len(), 1 + 2 + 1 + 2 + 13);
+        assert!(opened.right.ends_with(&[Item::Line(28), Item::Line(29)]));
     }
 
     #[test]
