@@ -1,6 +1,6 @@
 ---
 name: ribbon-notes
-description: Act on the notes a person left on a diff in ribbon (the side-by-side terminal diff viewer), and explain your own changes with notes they see beside the code. Use when the user says they left notes, comments, or review remarks in ribbon, mentions .ribbon/notes.json, or asks you to explain your changes in ribbon.
+description: Act on the notes a person left on a diff in ribbon (the side-by-side terminal diff viewer), and explain your own code changes with notes they see beside the code. Use when the user says they left notes, comments, or review remarks in ribbon, mentions .ribbon/notes.json, asks you to explain your changes in ribbon, or when you change code in a repository that has a .ribbon folder.
 ---
 
 # Notes in ribbon
@@ -66,7 +66,10 @@ show after the person opens and closes the editor with `e`, or opens ribbon agai
 
 ## Explain your own changes
 
-To tell the person why you changed something, add your own annotations to the same file:
+In a repository with a `.ribbon` folder, the person reads your changes in ribbon. Whenever you
+change code there, for a note or for any other request, add one note of your own for each
+change, so they see why beside the code. Add them when you finish the change, before you
+reply. Skip changes too small to need a reason, such as a typo fix.
 
 ```json
 {
@@ -80,6 +83,9 @@ To tell the person why you changed something, add your own annotations to the sa
 ```
 
 - Use `"author": "claude"` and leave out `status`: these are not tasks.
+- Put the range on the new lines of your change. For code you only removed, use `oldRange`.
+- When you change the same lines again, replace your earlier note on them instead of adding a
+  second one. You may change or remove your own notes; never the person's.
 - Give each one a unique `id`, and the text of the range's last line as `anchor`.
 - Keep `summary` to one sentence about what changed. Put the reason in `rationale`.
 - Add the file entry if the file has none yet.
