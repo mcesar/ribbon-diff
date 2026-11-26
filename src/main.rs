@@ -10,7 +10,7 @@
 
 mod context;
 mod git;
-mod gutter;
+mod ribbons;
 mod highlight;
 mod imports;
 mod model;

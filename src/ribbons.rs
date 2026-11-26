@@ -1,5 +1,5 @@
-//! The ribbon gutter: rasterize the visible ribbons, then show them with Kitty graphics
-//! or approximate them with half-block characters.
+//! The ribbons between the two sides: rasterize the visible ones, then show them with Kitty
+//! graphics or approximate them with half-block characters.
 
 use crate::highlight::Rgb;
 use crate::model::{Block, BlockKind};
@@ -38,7 +38,7 @@ fn ribbon_paint(kind: BlockKind, colors: &RibbonColors, width: f32, alpha: u8) -
     paint
 }
 
-/// Where the gutter is and what it shows. Two frames with equal views draw the same pixels.
+/// Where the ribbon column is and what it shows. Two frames with equal views draw the same pixels.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct View {
     pub left_top: usize,
@@ -98,8 +98,8 @@ pub fn rasterize(blocks: &[Block], view: View, colors: &RibbonColors) -> Option<
     Some(pixmap)
 }
 
-/// Kitty graphics: transmit a PNG and place it over the gutter cells in one command.
-/// PNG keeps each frame small (the gutter is mostly flat color). The same image id is reused,
+/// Kitty graphics: transmit a PNG and place it over the ribbon column in one command.
+/// PNG keeps each frame small (the ribbon column is mostly flat color). The same image id is reused,
 /// so each frame replaces the last one.
 pub fn kitty_place(pixmap: &Pixmap, column: u16, row: u16, view: View) -> String {
     let png = pixmap.encode_png().unwrap_or_default();

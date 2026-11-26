@@ -1,6 +1,6 @@
 //! The interactive two-pane view over one or more changed files.
 
-use crate::gutter::{self, RibbonColors, View};
+use crate::ribbons::{self, RibbonColors, View};
 use crate::highlight::{Highlighter, Paint, Rgb, Tokens};
 use crate::termcolors::{self, TermColors};
 use crate::model::{Block, BlockKind, Display, Item, Model, ScrollMap};
@@ -22,7 +22,7 @@ use std::thread;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const GUTTER_COLUMNS: u16 = 6;
+const RIBBON_COLUMNS: u16 = 6;
 const TAB: &str = "    ";
 const CONTEXT_ABOVE_CHANGE: usize = 3;
 
@@ -265,7 +265,7 @@ fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
 
 struct Layout {
     left: Rect,
-    gutter: Rect,
+    ribbons: Rect,
     right: Rect,
     status: Rect,
 }
@@ -278,23 +278,23 @@ enum Panes {
     New,
 }
 
-/// One side alone takes the whole width, with no gutter; the other side gets no columns.
+/// One side alone takes the whole width, with no ribbon column; the other side gets no columns.
 fn layout(area: Rect, panes: Panes) -> Layout {
     let body_height = area.height.saturating_sub(1);
-    let (left_width, gutter_width) = match panes {
+    let (left_width, ribbons_width) = match panes {
         Panes::Both => {
-            let side = area.width.saturating_sub(GUTTER_COLUMNS) / 2;
+            let side = area.width.saturating_sub(RIBBON_COLUMNS) / 2;
             (side, area.width.saturating_sub(side * 2))
         }
         Panes::Old => (area.width, 0),
         Panes::New => (0, 0),
     };
-    let right_width = area.width - left_width - gutter_width;
+    let right_width = area.width - left_width - ribbons_width;
     let body = |x, width| Rect { x, y: area.y, width, height: body_height };
     Layout {
         left: body(area.x, left_width),
-        gutter: body(area.x + left_width, gutter_width),
-        right: body(area.x + left_width + gutter_width, right_width),
+        ribbons: body(area.x + left_width, ribbons_width),
+        right: body(area.x + left_width + ribbons_width, right_width),
         status: Rect { y: area.y + area.height.saturating_sub(1), height: 1.min(area.height), ..area },
     }
 }
@@ -423,7 +423,7 @@ fn paint_columns(buf: &mut Buffer, (code_x, code_width): (u16, u16), y: u16, hsc
     }
 }
 
-/// Line numbers sit next to the gutter: at the right edge of the old side, the left edge of the
+/// Line numbers sit next to the ribbon column: at the right edge of the old side, the left edge of the
 /// new. A side alone has them on the left.
 fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool) {
     let theme = &app.theme;
@@ -611,7 +611,7 @@ fn styled_tokens(tokens: &Tokens, changed: &[Range<usize>], row: Style, change: 
 }
 
 /// Kitty mode leaves blank cells under the image; block mode draws the ribbons itself.
-fn draw_gutter(buf: &mut Buffer, area: Rect, blocks: &[Block], view: View, graphics: Graphics, theme: &Theme) {
+fn draw_ribbons(buf: &mut Buffer, area: Rect, blocks: &[Block], view: View, graphics: Graphics, theme: &Theme) {
     let base = theme.base();
     clear(buf, area, base);
     if graphics == Graphics::Kitty {
@@ -619,7 +619,7 @@ fn draw_gutter(buf: &mut Buffer, area: Rect, blocks: &[Block], view: View, graph
     }
     let background = base.bg.unwrap_or(Color::Reset);
     let color = |c: Option<Rgb>| c.map_or(background, rgb);
-    let cells = gutter::half_blocks(blocks, view, &theme.ribbons);
+    let cells = ribbons::half_blocks(blocks, view, &theme.ribbons);
     for (row, line) in cells.iter().enumerate() {
         for (col, (top, bottom)) in line.iter().enumerate() {
             if top.is_none() && bottom.is_none() {
@@ -1307,7 +1307,7 @@ pub fn restore_terminal(graphics: Graphics) {
     let mut out = io::stdout();
     // Only Kitty-capable terminals get graphics commands; others may print them as text.
     if graphics == Graphics::Kitty {
-        let _ = out.write_all(gutter::kitty_delete().as_bytes());
+        let _ = out.write_all(ribbons::kitty_delete().as_bytes());
     }
     let _ = out.write_all(MOUSE_OFF.as_bytes());
     let _ = out.write_all(KEYS_OFF.as_bytes());
@@ -1374,7 +1374,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         app.position = app.position.min(max);
         let (left_top, right_top) = app.stream.scroll.tops(app.position);
         let (cell_width, cell_height) = cell_pixels(area.width, area.height);
-        let view = View { left_top, right_top, columns: parts.gutter.width, rows: parts.gutter.height, cell_width, cell_height };
+        let view = View { left_top, right_top, columns: parts.ribbons.width, rows: parts.ribbons.height, cell_width, cell_height };
         let file = app.current_file();
         let shown = if app.panes == Panes::New { parts.right } else { parts.left };
         app.code_width = shown.width.saturating_sub(app.number_width + 1) as usize;
@@ -1392,7 +1392,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
                     draw_file_title(buf, Rect { height: 1, ..area }, &app, sticky, old_side, selected);
                 }
             }
-            draw_gutter(buf, parts.gutter, &app.stream.blocks, view, graphics, &app.theme);
+            draw_ribbons(buf, parts.ribbons, &app.stream.blocks, view, graphics, &app.theme);
             draw_status(buf, parts.status, &app, file);
             if let Some(selected) = app.picker {
                 draw_picker(buf, area, &app, selected);
@@ -1400,17 +1400,17 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         })?;
 
         if graphics == Graphics::Kitty {
-            // The picker covers the gutter, so the image comes down while it is open.
+            // The picker covers the ribbon column, so the image comes down while it is open.
             let wanted = app.picker.is_none().then_some((app.whole_file, app.generation, view));
             if wanted != last_image {
                 let backend = term.backend_mut();
                 match wanted {
                     Some(_) if view.columns > 0 && view.rows > 0 => {
-                        if let Some(pixmap) = gutter::rasterize(&app.stream.blocks, view, &app.theme.ribbons) {
-                            backend.write_all(gutter::kitty_place(&pixmap, parts.gutter.x, parts.gutter.y, view).as_bytes())?;
+                        if let Some(pixmap) = ribbons::rasterize(&app.stream.blocks, view, &app.theme.ribbons) {
+                            backend.write_all(ribbons::kitty_place(&pixmap, parts.ribbons.x, parts.ribbons.y, view).as_bytes())?;
                         }
                     }
-                    _ => backend.write_all(gutter::kitty_delete().as_bytes())?,
+                    _ => backend.write_all(ribbons::kitty_delete().as_bytes())?,
                 }
                 backend.flush()?;
                 last_image = wanted;
