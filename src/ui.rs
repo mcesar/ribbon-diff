@@ -27,7 +27,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const RIBBON_COLUMNS: u16 = 6;
 const TAB: &str = "    ";
-const CONTEXT_ABOVE_CHANGE: usize = 3;
 
 /// How much of the change color goes into a changed row and into its changed words. A faint
 /// row with clearly stronger words keeps the edit itself easy to spot.
@@ -55,6 +54,23 @@ pub enum Graphics {
     Blocks,
 }
 
+/// How the two versions are laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LayoutMode {
+    /// Unified in narrow terminals, split otherwise.
+    Auto,
+    /// Two sides with ribbons between them.
+    Split,
+    /// One column: removed lines above the lines that replace them.
+    Unified,
+}
+
+/// Auto layout is unified below this many columns.
+const AUTO_UNIFIED_BELOW: u16 = 120;
+
+/// The selection column for "the whole line", with room to add one.
+const LINE_END: usize = usize::MAX / 4;
+
 pub enum Outcome {
     Quit,
     QuitAll,
@@ -81,6 +97,14 @@ pub struct Settings {
     pub reloads: Option<mpsc::Receiver<Vec<FileDiff>>>,
     /// Read the changed files again, after the editor closes (without `--watch`).
     pub load_again: Option<Box<dyn Fn() -> Vec<FileDiff>>>,
+    /// Rows kept above a change, a match, or a note the view jumps to, and around the cursor
+    /// of a keyboard selection.
+    pub scroll_off: usize,
+    /// Start with long lines wrapped.
+    pub wrap: bool,
+    pub layout: LayoutMode,
+    /// Keys from the config file: a key, and the key it acts as.
+    pub keys: Vec<(crate::config::Key, crate::config::Key)>,
     /// Where notes for Claude are kept: `.ribbon/notes.json`.
     pub notes_file: PathBuf,
     /// Notes from an agent to show, read-only (`--agent-context`).
@@ -182,6 +206,9 @@ enum Row {
     Fold(usize, usize, usize),
     /// One row of a note under a line: the note's index in the app's notes, and which row.
     Note(usize, usize),
+    /// In the unified layout, a line of the old version: file, line index, and which screen
+    /// row of the line (0, or more when it wraps).
+    Old(usize, usize, usize),
     /// Space between two files.
     Gap,
 }
@@ -207,12 +234,16 @@ struct Stream {
     headers: Vec<usize>,
     /// Columns per screen row when long lines wrap.
     wrap: Option<usize>,
+    /// One column for both versions (the two sides hold the same rows).
+    unified: bool,
 }
 
 impl Stream {
     /// `opened` holds the folds to show, as (new file name, first new line hidden). With
     /// `wrap`, long lines take more rows, and the shorter of two level lines gets blank rows.
-    fn new(files: &[FileState], context: Option<usize>, opened: &HashSet<(String, usize)>, wrap: Option<usize>, notes: &[NoteRows]) -> Self {
+    /// With `unified`, both sides hold the same single column: each change's old lines (as
+    /// `Row::Old`) above its new lines, and no ribbons.
+    fn new(files: &[FileState], context: Option<usize>, opened: &HashSet<(String, usize)>, wrap: Option<usize>, notes: &[NoteRows], unified: bool) -> Self {
         let (mut left, mut right, mut headers) = (Vec::new(), Vec::new(), Vec::new());
         let (mut blocks, mut scroll_blocks) = (Vec::new(), Vec::new());
         for (index, file) in files.iter().enumerate() {
@@ -248,6 +279,16 @@ impl Stream {
             let mut file_scroll_blocks = display.scroll_blocks.clone();
             let mut file_blocks = display.blocks.clone();
 
+            if unified {
+                let (mut rows, mut file_blocks) = unified_rows(&file_left, &file_right, &display.blocks, &display.scroll_blocks);
+                expand_unified(file, wrap, &file_notes, &mut rows, &mut file_blocks);
+                let start = right.len();
+                blocks.extend(file_blocks.iter().map(|b| Block { a0: b.a0 + start, a1: b.a1 + start, b0: b.b0 + start, b1: b.b1 + start }));
+                left.extend(rows.iter().copied());
+                right.extend(rows);
+                continue;
+            }
+
             // Pad the shorter side with blank rows right after the file's last change, so both
             // sides end the file on the same row and the next file header lines up. The padding
             // belongs to the last change for scrolling, but not to its ribbon.
@@ -274,7 +315,7 @@ impl Stream {
             right.extend(file_right);
         }
         let scroll = ScrollMap::new(&scroll_blocks, left.len(), right.len());
-        Stream { left, right, blocks, scroll, headers, wrap }
+        Stream { left, right, blocks, scroll, headers, wrap, unified }
     }
 
     /// The file title to pin at the top: the file at the top of the view, unless its own
@@ -288,11 +329,11 @@ impl Stream {
     }
 
     /// Scroll positions that put each shown change a few rows below the top.
-    fn change_starts(&self) -> Vec<usize> {
+    fn change_starts(&self, scroll_off: usize) -> Vec<usize> {
         self.blocks
             .iter()
-            .filter_map(|b| self.scroll.block_start(b.a0, b.b0))
-            .map(|s| s.saturating_sub(CONTEXT_ABOVE_CHANGE))
+            .filter_map(|b| if self.unified { Some(self.scroll.position_of_row(b.b0, false)) } else { self.scroll.block_start(b.a0, b.b0) })
+            .map(|s| s.saturating_sub(scroll_off))
             .collect()
     }
 
@@ -305,6 +346,71 @@ impl Stream {
         let (left_top, _) = self.scroll.tops(position);
         self.headers.iter().rposition(|&row| row <= left_top).unwrap_or(0)
     }
+}
+
+/// The unified column of one file, from its two sides: rows outside changes once (from the new
+/// side), and for each shown change its old lines, then its new lines. A change whose
+/// differences are ignored (quiet) shows only its new lines. Also returns the changes, as
+/// row ranges of the column (the same on both "sides").
+fn unified_rows(left: &[Row], right: &[Row], shown: &[Block], scroll_blocks: &[Block]) -> (Vec<Row>, Vec<Block>) {
+    let (mut rows, mut blocks) = (Vec::new(), Vec::new());
+    let mut b = 0;
+    let mut sorted = scroll_blocks.to_vec();
+    sorted.sort_by_key(|block| block.b0);
+    let end = Block { a0: left.len(), a1: left.len(), b0: right.len(), b1: right.len() };
+    let not_gap = |r: &&Row| **r != Row::Gap;
+    for block in sorted.iter().chain([&end]) {
+        rows.extend(right[b..block.b0].iter().filter(not_gap));
+        let start = rows.len();
+        let is_shown = shown.iter().any(|s| s.a0 == block.a0 && s.b0 == block.b0);
+        if is_shown {
+            rows.extend(left[block.a0..block.a1].iter().filter_map(|r| match *r {
+                Row::Line(file, line) => Some(Row::Old(file, line, 0)),
+                _ => None,
+            }));
+        }
+        rows.extend(right[block.b0..block.b1].iter().filter(not_gap));
+        if is_shown {
+            blocks.push(Block { a0: start, a1: rows.len(), b0: start, b1: rows.len() });
+        }
+        b = block.b1;
+    }
+    (rows, blocks)
+}
+
+/// Wrap rows and note rows in the unified column.
+fn expand_unified(file: &FileState, wrap: Option<usize>, notes: &[&NoteRows], rows: &mut Vec<Row>, blocks: &mut [Block]) {
+    if wrap.is_none() && notes.is_empty() {
+        return;
+    }
+    let model = &file.diff.model;
+    let mut out = Vec::new();
+    let mut map = Vec::new();
+    for &row in rows.iter() {
+        map.push(out.len());
+        let (is_old, f, line) = match row {
+            Row::Line(f, line) => (false, f, line),
+            Row::Old(f, line, _) => (true, f, line),
+            _ => {
+                out.push(row);
+                continue;
+            }
+        };
+        out.push(row);
+        if let Some(width) = wrap {
+            let text = if is_old { &model.old[line] } else { &model.new[line] };
+            let parts = select::line_width(text).div_ceil(width.max(1)).max(1);
+            out.extend((1..parts).map(|part| if is_old { Row::Old(f, line, part) } else { Row::Wrap(f, line, part) }));
+        }
+        for note in notes.iter().filter(|n| n.old_side == is_old && n.line == line) {
+            out.extend((0..note.rows).map(|part| Row::Note(note.note, part)));
+        }
+    }
+    map.push(out.len());
+    for block in blocks.iter_mut() {
+        *block = Block { a0: map[block.a0], a1: map[block.a1], b0: map[block.b0], b1: map[block.b1] };
+    }
+    *rows = out;
 }
 
 /// Give each long line one more row per `width` columns (with wrapping on), and each line
@@ -571,11 +677,14 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 let label = format!("⋯ {hidden} unchanged lines (z or click to show)");
                 buf.set_line(code_x, y, &Line::styled(label, style), code_width);
             }
-            Some(&(Row::Line(file_index, index) | Row::Wrap(file_index, index, _))) => {
+            Some(&(Row::Line(file_index, index) | Row::Wrap(file_index, index, _) | Row::Old(file_index, index, _))) => {
                 let part = match rows[at] {
-                    Row::Wrap(_, _, part) => part,
+                    Row::Wrap(_, _, part) | Row::Old(_, _, part) => part,
                     _ => 0,
                 };
+                // The version this line is from: the side's own, or old in the unified column.
+                let pane_old_side = old_side;
+                let old_side = old_side || matches!(rows[at], Row::Old(..));
                 // Wrapped rows show the next slice of the line; otherwise the sideways scroll.
                 let skip = match app.stream.wrap {
                     Some(width) => part * width,
@@ -602,7 +711,13 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 let number = if numbers_right {
                     format!("{:>width$} ", index + 1, width = number_width as usize - 1)
                 } else {
-                    format!(" {:<width$}", index + 1, width = number_width as usize - 1)
+                    // In the unified column, changed lines start with - or +, as in a patch.
+                    let sign = match (app.unified, changed, old_side) {
+                        (true, true, true) => '-',
+                        (true, true, false) => '+',
+                        _ => ' ',
+                    };
+                    format!("{sign}{:<width$}", index + 1, width = number_width as usize - 1)
                 };
                 if part == 0 {
                     buf.set_line(number_x, y, &Line::styled(number, number_style), number_width);
@@ -622,7 +737,7 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 if let Some(found) = &app.search {
                     let current = found.matches.get(found.current);
                     for bytes in search::find_all(line, &found.query) {
-                        let is_current = current.is_some_and(|m| m.old_side == old_side && m.row == at - part && m.bytes == bytes);
+                        let is_current = current.is_some_and(|m| m.old_side == pane_old_side && m.row == at - part && m.bytes == bytes);
                         // Yellow like most editors; the current match is orange.
                         let bg = if is_current { Color::Indexed(208) } else { Color::Yellow };
                         let columns = (select::line_width(&line[..bytes.start]), select::line_width(&line[..bytes.end]));
@@ -631,7 +746,7 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                         });
                     }
                 }
-                if let Some((from, to)) = app.selected_columns(old_side, at) {
+                if let Some((from, to)) = app.selected_columns(pane_old_side, at) {
                     // Selected text is reversed, up to the end of the line.
                     let columns = (from, to.min(select::line_width(line)));
                     paint_columns(buf, code, y, skip, columns, |cell| {
@@ -679,7 +794,11 @@ fn draw_file_title(buf: &mut Buffer, area: Rect, app: &App, index: usize, old_si
     let file = &app.files[index];
     clear(buf, area, theme.panel());
     let name = if old_side { &file.diff.old_name } else { &file.diff.new_name };
-    let counts = if old_side { format!("-{}", file.removed) } else { format!("+{}", file.added) };
+    let counts = match (app.unified, old_side) {
+        (true, _) => format!("-{} +{}", file.removed, file.added),
+        (false, true) => format!("-{}", file.removed),
+        (false, false) => format!("+{}", file.added),
+    };
     let room = area.width.saturating_sub(counts.len() as u16 + 3) as usize;
     let path_style = if selected { theme.file_title().add_modifier(Modifier::REVERSED) } else { theme.file_title() };
     let spans = vec![
@@ -823,6 +942,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     clear(buf, area, style);
     // Say which side is alone on screen, and how to get both back.
     let side = match app.panes {
+        _ if app.unified => " UNIFIED (s split)  ·",
         Panes::Both => "",
         Panes::Old => " OLD SIDE ONLY (< both)  ·",
         Panes::New => " NEW SIDE ONLY (> both)  ·",
@@ -839,6 +959,9 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         (open, _) => format!("{file_part} {open} open notes  ·"),
     };
     let message = match (&app.notice, &app.search) {
+        _ if app.visual && app.notice.is_none() => {
+            Some(" VISUAL  j/k extend  y copy  a note  Y change  e edit  Esc cancel".to_owned())
+        }
         _ if app.copy_menu => Some(" copy:  p path  a absolute path  f file name  l path:line  c change   Esc cancel".to_owned()),
         _ if app.note_draft.is_some() => app.note_draft.as_ref().map(|d| {
             let lines = if d.range.0 == d.range.1 { format!("{}", d.range.0) } else { format!("{}-{}", d.range.0, d.range.1) };
@@ -863,7 +986,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     }
     let context = if app.whole_file { "c: context" } else { "c: whole file" };
     let text = format!(
-        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  a note  }}/{{ notes  z/Z fold  w wrap  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
+        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  a note  }}/{{ notes  z/Z fold  w wrap  s layout  v select  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
         app.current_change(),
         app.stream.blocks.len(),
         if app.hscroll > 0 { format!("  ·  col {}", app.hscroll + 1) } else { String::new() },
@@ -904,9 +1027,12 @@ fn draw_note_list(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
     }
 }
 
+/// A centered list of the changed files, filtered by what was typed; the selected one is
+/// highlighted.
 fn draw_picker(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
     let theme = &app.theme;
-    let width = area.width.saturating_sub(8).min(100).max(20);
+    let shown = app.picker_files();
+    let width = area.width.saturating_sub(8).min(110).max(20);
     let height = (app.files.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -917,19 +1043,26 @@ fn draw_picker(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
     clear(buf, Rect::new(x, y, width, height), frame);
     let count = app.files.len();
     let noun = if count == 1 { "changed file" } else { "changed files" };
-    let title = format!(" {count} {noun}  (Enter open, Esc close)");
+    let title = if app.picker_filter.is_empty() {
+        format!(" {count} {noun}  (type to filter, ↑/↓ move, Enter open, Esc close)")
+    } else {
+        format!(" {}/{count} {noun}  filter: {}█   (Esc clears)", shown.len(), app.picker_filter)
+    };
     buf.set_line(x, y, &Line::styled(title, frame.add_modifier(Modifier::BOLD)), width);
 
     let rows = (height - 2) as usize;
     let first = selected.saturating_sub(rows.saturating_sub(1));
-    for (row, (index, file)) in app.files.iter().enumerate().skip(first).take(rows).enumerate() {
-        let style = if index == selected { frame.add_modifier(Modifier::REVERSED) } else { frame };
+    for (row, (place, &index)) in shown.iter().enumerate().skip(first).take(rows).enumerate() {
+        let file = &app.files[index];
+        let style = if place == selected { frame.add_modifier(Modifier::REVERSED) } else { frame };
         let row_area = Rect::new(x, y + 1 + row as u16, width, 1);
         clear(buf, row_area, style);
+        let changes = file.diff.model.blocks.len();
         let spans = vec![
-            Span::styled(format!(" {:>5} ", format!("+{}", file.added)), style.fg(theme.change_color(false))),
+            Span::styled(format!(" {:>3} {:<8}", changes, if changes == 1 { "change" } else { "changes" }), style.fg(theme.muted())),
+            Span::styled(format!("{:>5} ", format!("+{}", file.added)), style.fg(theme.change_color(false))),
             Span::styled(format!("{:>5}  ", format!("-{}", file.removed)), style.fg(theme.change_color(true))),
-            Span::styled(fit_path(&file.diff.new_name, width.saturating_sub(15) as usize), style),
+            Span::styled(fit_path(&file.diff.new_name, width.saturating_sub(27) as usize), style),
         ];
         buf.set_line(x, row_area.y, &Line::from(spans), width);
     }
@@ -956,7 +1089,10 @@ struct App {
     position: usize,
     whole_file: bool,
     context: usize,
+    /// The file list, with the selected row of the filtered list.
     picker: Option<usize>,
+    /// What was typed in the file list.
+    picker_filter: String,
     theme: Theme,
     number_width: u16,
     /// The two sides from the last frame, to place mouse events.
@@ -982,6 +1118,18 @@ struct App {
     pending_edit: Option<(PathBuf, usize)>,
     /// The change n/N moved to last, by index.
     picked_change: Option<usize>,
+    /// Rows kept above jump targets and around the selection cursor.
+    scroll_off: usize,
+    keys: Vec<(crate::config::Key, crate::config::Key)>,
+    layout_mode: LayoutMode,
+    /// The unified layout is on screen (from `layout_mode` and the terminal width).
+    unified: bool,
+    /// The panes to go back to when the split layout returns.
+    split_panes: Panes,
+    /// A keyboard selection (`v`) is being made: j/k move its end.
+    visual: bool,
+    /// The line where the keyboard selection started: side and stream row.
+    visual_anchor: (bool, usize),
     /// Notes from the notes file, then from --agent-context.
     notes: Vec<Note>,
     notes_file: PathBuf,
@@ -1051,8 +1199,8 @@ impl App {
         self.selection = None;
         self.dragging = false;
         self.picked_change = None;
-        if let Some(selected) = self.picker {
-            self.picker = Some(selected.min(self.files.len() - 1));
+        if self.picker.is_some() {
+            self.picker = Some(0);
         }
 
         self.position = match anchor {
@@ -1091,12 +1239,24 @@ impl App {
     }
 
     /// The file and line of a row, and which screen row of a wrapped line it is.
-    fn line_of(&self, old_side: bool, row: usize) -> Option<(usize, usize, usize)> {
+    /// The line of a row: whether it is an old line, its file and index, and which screen row of
+    /// a wrapped line it is. In the unified layout one column holds lines of both versions.
+    fn line_of(&self, old_side: bool, row: usize) -> Option<(bool, usize, usize, usize)> {
+        // In the unified column, plain lines are new lines on either "side".
+        let side_is_old = old_side && !self.stream.unified;
         match self.rows(old_side).get(row)? {
-            &Row::Line(file, line) => Some((file, line, 0)),
-            &Row::Wrap(file, line, part) => Some((file, line, part)),
+            &Row::Line(file, line) => Some((side_is_old, file, line, 0)),
+            &Row::Wrap(file, line, part) => Some((side_is_old, file, line, part)),
+            &Row::Old(file, line, part) => Some((true, file, line, part)),
             _ => None,
         }
+    }
+
+    /// The text of a row's line.
+    fn text_of(&self, old_side: bool, row: usize) -> Option<&str> {
+        let (is_old, file, line, _) = self.line_of(old_side, row)?;
+        let model = &self.files[file].diff.model;
+        Some(if is_old { &model.old[line] } else { &model.new[line] })
     }
 
     /// The selected text columns of a row's line (whole line, not just the row), end
@@ -1107,7 +1267,7 @@ impl App {
         if row < start.0 || row > end.0 {
             return None;
         }
-        let line = |r: usize| self.line_of(old_side, r).map(|(file, line, _)| (file, line));
+        let line = |r: usize| self.line_of(old_side, r).map(|(is_old, file, line, _)| (is_old, file, line));
         let from = if line(row) == line(start.0) { start.1 } else { 0 };
         let to = if line(row) == line(end.0) { end.1 + 1 } else { usize::MAX };
         Some((from, to))
@@ -1163,12 +1323,20 @@ impl App {
     /// The new-side line at, or level with, a row: the row itself on the new side; on the old
     /// side, the first new line of the same file from the level row down.
     fn new_line_near(&self, old_side: bool, row: usize) -> Option<(usize, usize)> {
-        let (file, line, _) = self.line_of(old_side, row).or_else(|| match self.rows(old_side).get(row)? {
-            &Row::Header(file) => Some((file, 0, 0)),
+        let (is_old, file, line, _) = self.line_of(old_side, row).or_else(|| match self.rows(old_side).get(row)? {
+            &Row::Header(file) => Some((false, file, 0, 0)),
             _ => None,
         })?;
-        if !old_side {
+        if !is_old {
             return Some((file, line));
+        }
+        // Unified: the first new line below.
+        if self.stream.unified {
+            return (row..self.stream.right.len()).find_map(|r| match self.stream.right[r] {
+                Row::Line(f, line) if f == file => Some((f, line)),
+                Row::Header(f) if f != file => Some((file, 0)),
+                _ => None,
+            });
         }
         let (_, right_top) = self.stream.scroll.tops(self.stream.scroll.position_of_row(row, true));
         (right_top..self.stream.right.len()).take(500).find_map(|r| match self.stream.right[r] {
@@ -1198,9 +1366,9 @@ impl App {
         let top = if old_side { left_top } else { right_top };
         let shown = self.shown_rows(old_side, top, self.body_rows.max(1));
         let changed = shown.iter().find(|&&row| {
-            self.line_of(old_side, row).is_some_and(|(file, line, _)| {
+            self.line_of(old_side, row).is_some_and(|(is_old, file, line, _)| {
                 let state = &self.files[file];
-                (if old_side { &state.old_kinds } else { &state.new_kinds })[line].is_some()
+                (if is_old { &state.old_kinds } else { &state.new_kinds })[line].is_some()
             })
         });
         let any = shown.iter().find(|&&row| self.line_of(old_side, row).is_some());
@@ -1222,9 +1390,10 @@ impl App {
         }
         .unwrap_or(self.current_change().checked_sub(1)?);
         let block = *self.stream.blocks.get(index)?;
+        // A side's lines in the change (in the unified column, the old or new ones).
         let lines = |old_side: bool, rows: Range<usize>| -> Vec<(usize, usize)> {
-            rows.filter_map(|r| match self.rows(old_side)[r] {
-                Row::Line(file, line) => Some((file, line)),
+            rows.filter_map(|r| match self.line_of(old_side, r)? {
+                (is_old, file, line, 0) if is_old == old_side => Some((file, line)),
                 _ => None,
             })
             .collect()
@@ -1236,6 +1405,7 @@ impl App {
             lines.iter().map(|&(_, l)| if old_side { model.old[l].clone() } else { model.new[l].clone() }).collect()
         };
         match self.panes {
+            _ if self.unified => {}
             Panes::Old => return Some((text(true, &old).join("\n"), "old lines")),
             Panes::New => return Some((text(false, &new).join("\n"), "new lines")),
             Panes::Both => {}
@@ -1244,9 +1414,9 @@ impl App {
         let start = |old_side: bool, lines: &[(usize, usize)], first_row: usize| -> usize {
             match lines.first() {
                 Some(&(_, line)) => line + 1,
-                None => (0..first_row).rev().find_map(|r| match self.rows(old_side)[r] {
-                    Row::Line(f, line) if f == file => Some(line + 1),
-                    Row::Header(_) => Some(0),
+                None => (0..first_row).rev().find_map(|r| match (self.rows(old_side)[r], self.line_of(old_side, r)) {
+                    (_, Some((is_old, f, line, 0))) if is_old == old_side && f == file => Some(line + 1),
+                    (Row::Header(_), _) => Some(0),
                     _ => None,
                 }).unwrap_or(0),
             }
@@ -1320,7 +1490,7 @@ impl App {
     }
 
     fn build_stream(&self, wrap: Option<usize>) -> Stream {
-        Stream::new(&self.files, self.context_lines(), &self.opened, wrap, &self.note_rows())
+        Stream::new(&self.files, self.context_lines(), &self.opened, wrap, &self.note_rows(), self.unified)
     }
 
     /// Where each note shows: its file in the diff, side, and line. Notes on files that are not
@@ -1334,7 +1504,13 @@ impl App {
                 let file = self.files.iter().position(|f| *if note.old_side { &f.diff.old_name } else { &f.diff.new_name } == note.path)?;
                 let model = &self.files[file].diff.model;
                 let line = notes::place(note, if note.old_side { &model.old } else { &model.new })?;
-                Some(NoteRows { file, old_side: note.old_side, line, note: index, rows: notes::rows(note, width).len() })
+                // The unified column shows old lines only inside changes: a note on any other old
+                // line goes under the new line paired with it.
+                let (old_side, line) = match (self.unified && note.old_side).then(|| model.new_line_outside_changes(line)).flatten() {
+                    Some(new_line) => (false, new_line.min(model.new.len().saturating_sub(1))),
+                    None => (note.old_side, line),
+                };
+                Some(NoteRows { file, old_side, line, note: index, rows: notes::rows(note, width).len() })
             })
             .collect()
     }
@@ -1376,7 +1552,7 @@ impl App {
 
     /// The side and stream row where a note starts.
     fn note_row(&self, note: usize) -> Option<(bool, usize)> {
-        [true, false].into_iter().find_map(|old_side| self.rows(old_side).iter().position(|r| *r == Row::Note(note, 0)).map(|row| (old_side, row)))
+        [false, true].into_iter().find_map(|old_side| self.rows(old_side).iter().position(|r| *r == Row::Note(note, 0)).map(|row| (old_side, row)))
     }
 
     fn note_on_screen(&self, note: usize) -> bool {
@@ -1396,7 +1572,7 @@ impl App {
             self.panes = Panes::Both;
         }
         self.picked_note = Some(note);
-        self.position = self.stream.scroll.position_of_row(row, old_side).saturating_sub(CONTEXT_ABOVE_CHANGE + 1);
+        self.position = self.stream.scroll.position_of_row(row, old_side).saturating_sub(self.scroll_off + 1);
     }
 
     /// `}` and `{`: the next or previous note in the stream.
@@ -1445,10 +1621,12 @@ impl App {
         let place = match self.selection {
             Some(selection) => {
                 let (start, end) = selection.bounds();
-                let lines: Vec<(usize, usize)> = (start.0..=end.0).filter_map(|row| self.line_of(selection.old_side, row).map(|(f, l, _)| (f, l))).collect();
-                lines.last().map(|&(file, last)| {
-                    let first = lines.iter().find(|&&(f, _)| f == file).map_or(last, |&(_, l)| l);
-                    (file, selection.old_side, first, last)
+                let lines: Vec<(bool, usize, usize)> =
+                    (start.0..=end.0).filter_map(|row| self.line_of(selection.old_side, row).map(|(o, f, l, _)| (o, f, l))).collect();
+                // The note goes on the last line's file and version (unified columns mix both).
+                lines.last().map(|&(is_old, file, last)| {
+                    let first = lines.iter().find(|&&(o, f, _)| o == is_old && f == file).map_or(last, |&(_, _, l)| l);
+                    (file, is_old, first, last)
                 })
             }
             None => self.focus().map(|(file, line)| (file, false, line, line)),
@@ -1543,6 +1721,103 @@ impl App {
         };
     }
 
+    /// A key from the config file's [keys] table acts as the key it names.
+    fn remap(&self, event: &Event) -> Event {
+        let Event::Key(key) = event else { return event.clone() };
+        // Shift is part of the character itself ("K"), so it is not compared.
+        let modifiers = key.modifiers - KeyModifiers::SHIFT;
+        match self.keys.iter().find(|((code, mods), _)| *code == key.code && *mods == modifiers) {
+            Some(&(_, (code, mods))) => Event::Key(KeyEvent { code, modifiers: mods, ..*key }),
+            None => event.clone(),
+        }
+    }
+
+    /// `v`: select whole lines with the keyboard, from the line `e` would open (or the current
+    /// selection), on the side alone or the new side.
+    fn start_visual(&mut self) {
+        let old_side = self.panes == Panes::Old;
+        let row = match self.selection {
+            Some(selection) => Some((selection.old_side, selection.bounds().0 .0)),
+            None => {
+                let (left_top, right_top) = self.stream.scroll.tops(self.position);
+                let top = if old_side { left_top } else { right_top };
+                let shown = self.shown_rows(old_side, top, self.body_rows.max(1));
+                let changed = shown.iter().copied().find(|&row| {
+                    self.line_of(old_side, row).is_some_and(|(is_old, file, line, _)| {
+                        let state = &self.files[file];
+                        (if is_old { &state.old_kinds } else { &state.new_kinds })[line].is_some()
+                    })
+                });
+                changed.or_else(|| shown.iter().copied().find(|&row| self.line_of(old_side, row).is_some())).map(|row| (old_side, row))
+            }
+        };
+        let Some((old_side, row)) = row else {
+            self.notice = Some("no line on screen to select".into());
+            return;
+        };
+        self.visual = true;
+        self.visual_anchor = (old_side, row);
+        self.set_visual_head(row);
+    }
+
+    /// Select whole lines from the anchor to `head`, which may be above it.
+    fn set_visual_head(&mut self, head: usize) {
+        let (old_side, anchor) = self.visual_anchor;
+        self.selection = Some(if head >= anchor {
+            Selection { old_side, anchor: (anchor, 0), head: (head, LINE_END) }
+        } else {
+            Selection { old_side, anchor: (anchor, LINE_END), head: (head, 0) }
+        });
+    }
+
+    /// j/k (and arrows) move the end of a keyboard selection by one line; the view follows it.
+    /// Returns false for keys that are not about the selection.
+    fn apply_visual_key(&mut self, key: &KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return true;
+        }
+        let forward = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => true,
+            KeyCode::Char('k') | KeyCode::Up => false,
+            _ => return false,
+        };
+        let (old_side, anchor) = self.visual_anchor;
+        let head = self.selection.map_or(anchor, |s| s.head.0);
+        let rows = self.rows(old_side).len();
+        // The first row of the next or previous line (wrapped rows and notes are skipped).
+        let starts_line = |row: usize| self.line_of(old_side, row).is_some_and(|(_, _, _, part)| part == 0);
+        let next = if forward { (head + 1..rows).find(|&r| starts_line(r)) } else { (0..head).rev().find(|&r| starts_line(r)) };
+        let Some(next) = next else { return true };
+        self.set_visual_head(next);
+        // Keep `scroll_off` rows around the end of the selection.
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let top = if old_side { left_top } else { right_top };
+        let off = self.scroll_off.min(self.body_rows.saturating_sub(1) / 2);
+        if next < top + off {
+            self.position = self.stream.scroll.position_of_row(next.saturating_sub(off), old_side);
+        } else if next + off + 1 > top + self.body_rows {
+            self.position = self.stream.scroll.position_of_row((next + off + 1).saturating_sub(self.body_rows), old_side);
+        }
+        true
+    }
+
+    /// Switch between the split and the unified layout, on the same line.
+    fn set_unified(&mut self, unified: bool) {
+        if unified == self.unified {
+            return;
+        }
+        self.unified = unified;
+        if unified {
+            self.split_panes = self.panes;
+            // The column is drawn where the new side goes, at full width.
+            self.panes = Panes::New;
+        } else {
+            self.panes = self.split_panes;
+        }
+        self.visual = false;
+        self.rebuild(self.stream.wrap);
+    }
+
     fn numbers_right(&self, old_side: bool) -> bool {
         old_side && self.panes == Panes::Both
     }
@@ -1619,7 +1894,7 @@ impl App {
         if let Some(index) = self.picked_change.filter(|&i| self.change_on_screen(i)) {
             return index + 1;
         }
-        let passed = self.stream.change_starts().iter().filter(|&&s| s <= self.position).count();
+        let passed = self.stream.change_starts(self.scroll_off).iter().filter(|&&s| s <= self.position).count();
         if self.stream.blocks.is_empty() { 0 } else { passed.max(1) }
     }
 
@@ -1640,7 +1915,7 @@ impl App {
         let had_search = self.search.is_some();
         self.stream = self.build_stream(self.stream.wrap);
         self.generation += 1;
-        let starts = self.stream.change_starts();
+        let starts = self.stream.change_starts(self.scroll_off);
         // Stay on the same change, or on the same file when it has none above the view.
         self.position = match starts.get(change.saturating_sub(1)) {
             Some(&start) if self.stream.file_at(start) == file => start,
@@ -1686,9 +1961,19 @@ impl App {
             }
             return None;
         }
+        let remapped = self.remap(event);
+        let event = &remapped;
         if let Event::Mouse(mouse) = event {
             if self.select(mouse) {
+                self.visual = false;
                 return None;
+            }
+        }
+        if self.visual {
+            if let Event::Key(key) = event {
+                if self.apply_visual_key(key) {
+                    return None;
+                }
             }
         }
         if let Some(columns) = self.horizontal(event) {
@@ -1697,7 +1982,7 @@ impl App {
         }
         let file = self.current_file();
         let files = self.files.len();
-        let starts = self.stream.change_starts();
+        let starts = self.stream.change_starts(self.scroll_off);
         let position = self.position;
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -1750,7 +2035,12 @@ impl App {
                     }
                     KeyCode::Char('a') => {
                         self.start_note();
+                        self.visual = false;
                         position
+                    }
+                    KeyCode::Char('v') => {
+                        self.start_visual();
+                        self.position
                     }
                     KeyCode::Char('}') => {
                         self.step_note(true);
@@ -1807,6 +2097,15 @@ impl App {
                     KeyCode::Char(' ') | KeyCode::PageDown => self.scrolled(position, page as isize),
                     KeyCode::PageUp => self.scrolled(position, -(page as isize)),
                     // Show one side alone; the same key again shows both.
+                    KeyCode::Char('<' | '>') if self.unified => {
+                        self.notice = Some("the unified layout shows both versions; s splits it".into());
+                        position
+                    }
+                    KeyCode::Char('s') => {
+                        // The event loop switches the layout.
+                        self.layout_mode = if self.unified { LayoutMode::Split } else { LayoutMode::Unified };
+                        position
+                    }
                     KeyCode::Char('<') => {
                         self.panes = if self.panes == Panes::Old { Panes::Both } else { Panes::Old };
                         self.selection = None;
@@ -1848,6 +2147,8 @@ impl App {
                         self.position
                     }
                     KeyCode::Char('f') | KeyCode::Tab => {
+                        // Open on the current file, unfiltered.
+                        self.picker_filter.clear();
                         self.picker = Some(file);
                         position
                     }
@@ -1861,21 +2162,27 @@ impl App {
             },
             _ => {}
         }
+        if self.selection.is_none() {
+            self.visual = false;
+        }
         None
     }
 
+    /// The text of the line that starts at a row (not the later rows of a wrapped line).
     fn line_at(&self, old_side: bool, row: usize) -> Option<&str> {
-        let rows = if old_side { &self.stream.left } else { &self.stream.right };
-        let &Row::Line(file, index) = rows.get(row)? else { return None };
-        let model = &self.files[file].diff.model;
-        Some(if old_side { &model.old[index] } else { &model.new[index] })
+        match self.line_of(old_side, row)? {
+            (_, _, _, 0) => self.text_of(old_side, row),
+            _ => None,
+        }
     }
 
     /// Find the query in every shown line of both sides, in scroll order.
     fn update_matches(&mut self) {
         let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else { return };
         let mut matches = Vec::new();
-        for old_side in [true, false] {
+        // The unified column is the same on both sides: search it once.
+        let sides: &[bool] = if self.stream.unified { &[false] } else { &[true, false] };
+        for &old_side in sides {
             let rows = if old_side { self.stream.left.len() } else { self.stream.right.len() };
             for row in 0..rows {
                 if let Some(line) = self.line_at(old_side, row) {
@@ -1908,9 +2215,10 @@ impl App {
         let (from, to) = (select::line_width(&line[..m.bytes.start]), select::line_width(&line[..m.bytes.end]));
         // A wrapped line shows the match on a later row.
         let row = m.row + self.stream.wrap.map_or(0, |width| from / width.max(1));
-        // The first row can be under the sticky file title.
-        if row <= top || row >= top + self.body_rows {
-            self.position = self.stream.scroll.position_of_row(row, m.old_side).saturating_sub(CONTEXT_ABOVE_CHANGE);
+        // Keep `scroll_off` rows around the match (the first row can be under the sticky title).
+        let off = self.scroll_off.min(self.body_rows.saturating_sub(1) / 2);
+        if row <= top + off || row + off >= top + self.body_rows {
+            self.position = self.stream.scroll.position_of_row(row, m.old_side).saturating_sub(off);
         }
         if self.wrap {
             return;
@@ -1993,7 +2301,7 @@ impl App {
         let at = shown.get(row).or(shown.last()).copied().unwrap_or(top);
         // On a wrapped line, the column counts from the line start.
         let skip = match self.stream.wrap {
-            Some(width) => self.line_of(old_side, at).map_or(0, |(_, _, part)| part * width),
+            Some(width) => self.line_of(old_side, at).map_or(0, |(_, _, _, part)| part * width),
             None => self.hscroll,
         };
         (at, column + skip)
@@ -2054,14 +2362,13 @@ impl App {
         let rows = if selection.old_side { &self.stream.left } else { &self.stream.right };
         let (start, end) = selection.bounds();
         let mut lines = Vec::new();
-        let mut last_line = None;
+        let mut last_line: Option<(bool, usize, usize)> = None;
         for row in start.0..=end.0 {
             match rows.get(row) {
                 // A wrapped line counts once.
-                Some(&(Row::Line(file, index) | Row::Wrap(file, index, _))) if last_line != Some((file, index)) => {
-                    last_line = Some((file, index));
-                    let model = &self.files[file].diff.model;
-                    let line = if selection.old_side { &model.old[index] } else { &model.new[index] };
+                Some(&(Row::Line(..) | Row::Wrap(..) | Row::Old(..))) if last_line != self.line_of(selection.old_side, row) .map(|(o, f, l, _)| (o, f, l)) => {
+                    last_line = self.line_of(selection.old_side, row).map(|(o, f, l, _)| (o, f, l));
+                    let line = self.text_of(selection.old_side, row).unwrap_or("");
                     let (from, to) = self.selected_columns(selection.old_side, row).unwrap_or((0, 0));
                     lines.push(select::slice_columns(line, from, to));
                 }
@@ -2115,21 +2422,52 @@ impl App {
         }
     }
 
+    /// The files the list shows: those whose path has every word of the filter, ignoring case.
+    fn picker_files(&self) -> Vec<usize> {
+        let words: Vec<String> = self.picker_filter.to_lowercase().split_whitespace().map(str::to_owned).collect();
+        (0..self.files.len())
+            .filter(|&i| {
+                let path = self.files[i].diff.new_name.to_lowercase();
+                words.iter().all(|w| path.contains(w.as_str()))
+            })
+            .collect()
+    }
+
+    /// The file list: typing filters it; arrows (or Ctrl-N/P, Ctrl-J/K) move.
     fn apply_picker(&mut self, key: &KeyEvent, selected: usize) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        let last = self.files.len() - 1;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = self.picker_files().len();
+        let last = count.saturating_sub(1);
         self.picker = match key.code {
-            KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') | KeyCode::Tab => None,
+            KeyCode::Esc if !self.picker_filter.is_empty() => {
+                self.picker_filter.clear();
+                Some(0)
+            }
+            KeyCode::Esc | KeyCode::Tab => None,
+            KeyCode::Char('c') if ctrl => None,
             KeyCode::Enter => {
-                self.position = self.stream.header_position(selected);
+                if let Some(&file) = self.picker_files().get(selected) {
+                    self.position = self.stream.header_position(file);
+                }
                 None
             }
-            KeyCode::Char('j') | KeyCode::Down => Some((selected + 1).min(last)),
-            KeyCode::Char('k') | KeyCode::Up => Some(selected.saturating_sub(1)),
-            KeyCode::Char('g') | KeyCode::Home => Some(0),
-            KeyCode::Char('G') | KeyCode::End => Some(last),
+            KeyCode::Down => Some((selected + 1).min(last)),
+            KeyCode::Char('n' | 'j') if ctrl => Some((selected + 1).min(last)),
+            KeyCode::Up => Some(selected.saturating_sub(1)),
+            KeyCode::Char('p' | 'k') if ctrl => Some(selected.saturating_sub(1)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(last),
+            KeyCode::Backspace => {
+                self.picker_filter.pop();
+                Some(0)
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.picker_filter.push(c);
+                Some(0)
+            }
             _ => Some(selected),
         };
     }
@@ -2198,16 +2536,24 @@ pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> 
 fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, terminal_colors: TermColors) -> anyhow::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
-    let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None, &[]);
+    let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None, &[], false);
     let mut highlights = spawn_highlighting(&files, &settings.highlighter);
     let (max_width, number_width) = measure(&files);
     let mut app = App {
-        position: stream.change_starts().first().copied().unwrap_or(0),
+        position: stream.change_starts(settings.scroll_off).first().copied().unwrap_or(0),
         stream,
         files,
         whole_file: false,
         context: settings.context,
         picker: None,
+        picker_filter: String::new(),
+        scroll_off: settings.scroll_off,
+        keys: settings.keys.clone(),
+        visual: false,
+        visual_anchor: (false, 0),
+        layout_mode: settings.layout,
+        unified: false,
+        split_panes: Panes::Both,
         theme: Theme::new(&settings.highlighter, terminal_colors),
         number_width,
         hscroll: 0,
@@ -2222,7 +2568,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         panes: Panes::Both,
         generation: 0,
         opened: HashSet::new(),
-        wrap: false,
+        wrap: settings.wrap,
         copy_menu: false,
         pending_edit: None,
         picked_change: None,
@@ -2244,6 +2590,12 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
     loop {
         let size = term.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
+        let unified = match app.layout_mode {
+            LayoutMode::Unified => true,
+            LayoutMode::Split => false,
+            LayoutMode::Auto => area.width < AUTO_UNIFIED_BELOW,
+        };
+        app.set_unified(unified);
         let parts = layout(area, app.panes);
         let body_rows = parts.left.height as usize;
         // Wrapping follows the width of the code on screen; both sides wrap at the same width.
@@ -2398,7 +2750,7 @@ mod tests {
         let old = format!("a\n{long}\nb\nc\nd\n");
         let new = format!("a\n{long}\nb\nCHANGED {long}\nd\n");
         let files = vec![file("a.ts", &old, &new)];
-        let stream = Stream::new(&files, None, &HashSet::new(), Some(10), &[]);
+        let stream = Stream::new(&files, None, &HashSet::new(), Some(10), &[], false);
         // Header, a, the long line in 3 rows, b, then the change: "c" (1 row) vs 4 rows.
         assert_eq!(stream.right[2..6], [Row::Line(0, 1), Row::Wrap(0, 1, 1), Row::Wrap(0, 1, 2), Row::Line(0, 2)]);
         assert_eq!(stream.left[2..6], stream.right[2..6]);
@@ -2417,7 +2769,7 @@ mod tests {
         // A note outside changes on the new side (line 5, inside the first fold), and one on
         // the old side of the change (line 20).
         let notes = [note(4, false, 0, 2), note(19, true, 1, 3)];
-        let stream = Stream::new(&files, Some(3), &HashSet::new(), None, &notes);
+        let stream = Stream::new(&files, Some(3), &HashSet::new(), None, &notes, false);
         let at = |rows: &[Row], r: Row| rows.iter().position(|x| *x == r).unwrap();
         let (left, right) = (&stream.left, &stream.right);
         assert_eq!(&right[at(right, Row::Line(0, 4)) + 1..][..2], [Row::Note(0, 0), Row::Note(0, 1)]);
@@ -2433,6 +2785,19 @@ mod tests {
     }
 
     #[test]
+    fn unified_puts_old_lines_above_new_ones() {
+        let files = vec![file("a.ts", "a\nb\nc\nd\n", "a\nB\nB2\nc\nd\n")];
+        let stream = Stream::new(&files, None, &HashSet::new(), None, &[], true);
+        assert_eq!(stream.left, stream.right);
+        assert_eq!(
+            stream.right,
+            [Row::Header(0), Row::Line(0, 0), Row::Old(0, 1, 0), Row::Line(0, 1), Row::Line(0, 2), Row::Line(0, 3), Row::Line(0, 4)]
+        );
+        assert_eq!(stream.blocks, [Block { a0: 2, a1: 5, b0: 2, b1: 5 }]);
+        assert_eq!(stream.change_starts(0), [2]);
+    }
+
+    #[test]
     fn both_sides_reach_each_file_header_together() {
         let numbers = |n: usize| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
         let files = vec![
@@ -2440,7 +2805,7 @@ mod tests {
             file("a.ts", &numbers(20), &numbers(20).replace("\n18\n", "\n18\nx\ny\nz\nw\n")),
             file("b.ts", &numbers(30), &numbers(30).replace("\n5\n", "\nfive\n")),
         ];
-        let stream = Stream::new(&files, Some(3), &HashSet::new(), None, &[]);
+        let stream = Stream::new(&files, Some(3), &HashSet::new(), None, &[], false);
         for (index, &row) in stream.headers.iter().enumerate() {
             let (left, right) = stream.scroll.tops(stream.header_position(index));
             assert_eq!(stream.left[left], Row::Header(index));

@@ -44,6 +44,26 @@ pub struct Model {
     pub new_inline: Vec<Vec<Range<usize>>>,
 }
 
+impl Model {
+    /// The new line paired with old line `old`, when `old` is not part of a shown change: the
+    /// same line of an unchanged stretch, or the start of a quiet change that holds it.
+    pub fn new_line_outside_changes(&self, old: usize) -> Option<usize> {
+        let mut all: Vec<(&Block, bool)> = self.blocks.iter().map(|b| (b, true)).chain(self.quiet.iter().map(|b| (b, false))).collect();
+        all.sort_by_key(|(b, _)| b.a0);
+        let mut shift = 0isize;
+        for (block, shown) in all {
+            if old < block.a0 {
+                break;
+            }
+            if old < block.a1 {
+                return (!shown).then_some(block.b0);
+            }
+            shift = block.b1 as isize - block.a1 as isize;
+        }
+        old.checked_add_signed(shift)
+    }
+}
+
 pub fn split_lines(text: &str) -> Vec<String> {
     let text = text.replace("\r\n", "\n");
     if text.is_empty() {
@@ -665,6 +685,14 @@ mod tests {
     fn no_word_marks_when_most_of_the_line_changed() {
         let (old, new) = inline_changes("expect(a).toBe(1)", "// a comment about something else");
         assert!(old.is_empty() && new.is_empty());
+    }
+
+    #[test]
+    fn pairs_old_lines_outside_changes_with_new_ones() {
+        let m = model("a\nb\nc\nd\n", "a\nX\nY\nc\nd\n");
+        assert_eq!(m.new_line_outside_changes(0), Some(0));
+        assert_eq!(m.new_line_outside_changes(1), None);
+        assert_eq!(m.new_line_outside_changes(3), Some(4));
     }
 
     #[test]

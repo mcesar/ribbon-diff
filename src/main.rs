@@ -8,6 +8,7 @@
 //!
 //! When stdout is not a terminal (a pager, a pipe), ribbon prints a unified diff instead.
 
+mod config;
 mod context;
 mod git;
 mod ribbons;
@@ -31,7 +32,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
-use ui::{FileDiff, Graphics, Outcome, Settings};
+use ui::{FileDiff, Graphics, LayoutMode, Outcome, Settings};
 
 /// Instructions for Claude to act on notes: `ribbon skill`.
 const SKILL: &str = include_str!("../skills/ribbon-notes/SKILL.md");
@@ -67,6 +68,11 @@ OPTIONS:
     --watch[=INTERVAL]          reload when the files change (git and two-path modes); checks
                                 every second, or every INTERVAL such as 500ms or 2s
     --agent-context FILE        show notes from an agent beside the diff (Hunk's format)
+    --layout auto|split|unified two sides, or one column with removed lines above added ones;
+                                auto (the default) is unified in terminals under 120 columns
+    --wrap                      wrap long lines (the w key switches it)
+    --scroll-off N              rows kept above a change, match, or note the view jumps to,
+                                and around the keyboard selection (default: 3)
     -U, --context N             unchanged lines shown around each change (default: 3)
     --theme NAME                terminal (default: the terminal's own colors), or a syntect theme
     --graphics auto|kitty|blocks
@@ -79,7 +85,9 @@ KEYS:
     j/k, arrows, wheel  scroll        space/S-space  page        d/u  half page
     h/l, H/L, 0         scroll sideways
     n/N                 next/prev change         ]/[      next/prev file
-    f, Tab              file list                c        whole file / changes only
+    f, Tab              file list (type to filter, arrows move, Enter opens)
+    c                   whole file / changes only
+    s                   split / unified layout   v        select lines (j/k extend)
     z, click a fold     show the hidden lines    Z        fold them again
     w                   wrap long lines
     g/G                 top/end                  q        quit
@@ -90,6 +98,11 @@ KEYS:
     Y                   copy the change as a patch (one side alone: its lines)
     a                   add a note for Claude on the selected or first changed line
     } / {               next/prev note          A        all notes      x  delete note
+
+CONFIG:
+    ~/.config/ribbon/config.toml sets defaults with the long option names, such as
+    context = 5, ignore-comments = true, layout = \"split\", watch = \"500ms\". A [keys] table
+    makes one key act as another: \"ctrl-d\" = \"pagedown\". The command line wins over the file.
 
 NOTES:
     Notes are kept in .ribbon/notes.json at the top of the repository, and show again when
@@ -112,6 +125,67 @@ struct Options {
     patch: Option<String>,
     /// Notes from an agent, in Hunk's agent-context format.
     agent_context: Option<PathBuf>,
+    scroll_off: usize,
+    wrap: bool,
+    layout: LayoutMode,
+    /// Keys from the config file: a key, and the key it acts as.
+    keys: Vec<(config::Key, config::Key)>,
+}
+
+fn parse_layout(text: &str) -> anyhow::Result<LayoutMode> {
+    Ok(match text {
+        "auto" => LayoutMode::Auto,
+        "split" => LayoutMode::Split,
+        "unified" => LayoutMode::Unified,
+        other => anyhow::bail!("layout must be auto, split, or unified, not {other:?}"),
+    })
+}
+
+fn parse_graphics(text: &str) -> anyhow::Result<Option<Graphics>> {
+    Ok(match text {
+        "kitty" => Some(Graphics::Kitty),
+        "blocks" => Some(Graphics::Blocks),
+        "auto" => None,
+        other => anyhow::bail!("graphics must be auto, kitty, or blocks, not {other:?}"),
+    })
+}
+
+/// Defaults from the config file, before the command line.
+fn apply_config(options: &mut Options, table: &toml::Table) -> anyhow::Result<()> {
+    use toml::Value;
+    for (name, value) in table {
+        let key = name.replace('_', "-");
+        let flag = |value: &Value| value.as_bool().with_context(|| format!("{name} must be true or false"));
+        let number = |value: &Value| value.as_integer().filter(|n| *n >= 0).map(|n| n as usize).with_context(|| format!("{name} must be a number"));
+        let text = |value: &Value| value.as_str().map(str::to_owned).with_context(|| format!("{name} must be a string"));
+        match key.as_str() {
+            "context" => options.context = number(value)?,
+            "scroll-off" => options.scroll_off = number(value)?,
+            "theme" => options.theme = text(value)?,
+            "graphics" => options.graphics = parse_graphics(&text(value)?)?,
+            "layout" => options.layout = parse_layout(&text(value)?)?,
+            "ignore-all-space" | "ignore-whitespace" => options.ignore_whitespace = flag(value)?,
+            "ignore-comments" => options.ignore_comments = flag(value)?,
+            "ignore-imports" => options.ignore_imports = flag(value)?,
+            "untracked" => options.untracked = flag(value)?,
+            "wrap" => options.wrap = flag(value)?,
+            "watch" => {
+                options.watch = match value {
+                    Value::Boolean(on) => on.then_some(Duration::from_secs(1)),
+                    _ => Some(parse_interval(&text(value)?)?),
+                }
+            }
+            "keys" => {
+                let keys = value.as_table().context("keys must be a table, like [keys]")?;
+                for (from, to) in keys {
+                    let to = to.as_str().with_context(|| format!("key {from:?} must name a key, like \"pagedown\""))?;
+                    options.keys.push((config::parse_key(from)?, config::parse_key(to)?));
+                }
+            }
+            _ => anyhow::bail!("unknown setting {name:?}"),
+        }
+    }
+    Ok(())
 }
 
 fn parse_args() -> anyhow::Result<Option<Options>> {
@@ -128,7 +202,13 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         positional: Vec::new(),
         patch: None,
         agent_context: None,
+        scroll_off: 3,
+        wrap: false,
+        layout: LayoutMode::Auto,
+        keys: Vec::new(),
     };
+    let config = config::load()?;
+    apply_config(&mut options, &config).with_context(|| format!("in {}", config::path().unwrap_or_default().display()))?;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         // After "--" everything is a pathspec for git.
@@ -159,14 +239,12 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
             "--context" | "-U" => {
                 options.context = args.next().context("--context needs a number")?.parse().context("--context needs a number")?
             }
-            "--graphics" => {
-                options.graphics = match args.next().as_deref() {
-                    Some("kitty") => Some(Graphics::Kitty),
-                    Some("blocks") => Some(Graphics::Blocks),
-                    Some("auto") => None,
-                    other => anyhow::bail!("--graphics must be auto, kitty, or blocks, not {other:?}"),
-                }
+            "--graphics" => options.graphics = parse_graphics(&args.next().unwrap_or_default()).context("--graphics")?,
+            "--layout" => options.layout = parse_layout(&args.next().unwrap_or_default()).context("--layout")?,
+            "--scroll-off" => {
+                options.scroll_off = args.next().context("--scroll-off needs a number")?.parse().context("--scroll-off needs a number")?
             }
+            "--wrap" => options.wrap = true,
             _ => options.positional.push(arg),
         }
     }
@@ -637,6 +715,10 @@ fn run() -> anyhow::Result<ExitCode> {
         load_again,
         notice,
         // Notes live at the top of the repository, or in the current folder outside git.
+        scroll_off: options.scroll_off,
+        wrap: options.wrap,
+        layout: options.layout,
+        keys: options.keys.clone(),
         notes_file: notes::notes_file(&git::top_level().unwrap_or_else(|_| PathBuf::from("."))),
         agent_context: options.agent_context.clone(),
     };

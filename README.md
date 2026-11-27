@@ -68,11 +68,13 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `]` / `[` | next / previous file |
 | `/` | search both sides as you type (lowercase ignores case); `Enter` keeps it, `Esc` cancels |
 | `n` / `N` after a search | next / previous match; `Esc` clears the search |
-| `f`, `Tab` | file list |
+| `f`, `Tab` | file list with each file's number of changes; type to filter it (words in any order), `↑`/`↓` to move, `Enter` to open |
 | `c` | whole file / changes only |
 | `z`, click a fold | show the lines of one fold (the first one on screen, for `z`) |
 | `Z` | close every opened fold (`c` twice does too) |
 | `w` | wrap long lines / scroll them sideways |
+| `s` | split / unified layout (unified: removed lines above the lines that replace them, in one column) |
+| `v` | select whole lines with the keyboard: `j`/`k` extend, then `y` copy, `a` note, `Y` change, `e` edit, `Esc` cancel |
 | `e` | open `$VISUAL` or `$EDITOR` at the line: the start of the selection, or else the first changed line on screen; the view reloads after the editor closes |
 | `<` / `>` | old side alone / new side alone, full width; the same key again shows both |
 | `g` / `G` | top / end |
@@ -114,10 +116,34 @@ it too. `--agent-context FILE` shows such a file from another tool, read-only.
 - `--ignore-imports`: compare lines without import statements (JavaScript, TypeScript, Python, Rust, Go). A file whose only changes are imports drops out.
 - `--watch[=INTERVAL]`: reload when the files change, and stay on the same file and line. It checks every second (or every INTERVAL, such as `500ms` or `2s`) by asking git for the changed files and looking at their times. Works in git mode and two-path mode.
 - `-U, --context N`: unchanged lines shown around each change (default 3). When a fold hides the line that starts the function (or method, or class) around the next change, that line stays visible inside the fold.
+- `--layout auto|split|unified`: two sides with ribbons, or one column. `auto` (the default) is unified in terminals under 120 columns; `s` switches.
+- `--wrap`: start with long lines wrapped.
+- `--scroll-off N`: rows kept above a change, a match, or a note the view jumps to, and around the end of a keyboard selection (default 3).
 - `--agent-context FILE`: show notes from an agent beside the diff, read-only (Hunk's agent-context JSON).
 - `--graphics auto|kitty|blocks`: how to draw ribbons. `auto` asks the terminal if it shows Kitty graphics.
 - `--theme NAME`: syntect theme (default `base16-ocean.dark`).
 - `--name PATH`: display name, also used to pick the syntax.
+
+## Config file
+
+`~/.config/ribbon/config.toml` (or under `$XDG_CONFIG_HOME`) sets defaults with the long option
+names. The command line wins over it.
+
+```toml
+context = 5
+ignore-comments = true
+layout = "split"
+watch = "500ms"   # or true
+scroll-off = 4
+wrap = true
+
+[keys]            # a key = the key it acts as
+"ctrl-d" = "pagedown"
+"K" = "{"
+```
+
+Key names are one character, or `space`, `enter`, `tab`, `esc`, `backspace`, `up`, `down`, `left`,
+`right`, `pageup`, `pagedown`, `home`, `end`, with `ctrl-` or `alt-` in front.
 
 ## License
 
