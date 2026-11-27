@@ -35,6 +35,8 @@ const WORD_TINT: f32 = 0.42;
 
 const INSERT: Rgb = [98, 186, 108];
 const DELETE: Rgb = [224, 98, 88];
+/// Moved lines, on both sides.
+const MOVED: Rgb = [150, 125, 230];
 
 /// Button, wheel, and drag reports (SGR encoding). Motion is reported only while a button is
 /// down. crossterm's EnableMouseCapture also turns on "report every motion", which can flood the
@@ -116,6 +118,8 @@ pub struct Settings {
     pub agent_context: Option<PathBuf>,
     /// Shown in the status line at the start, such as the commit for `ribbon show`.
     pub notice: Option<String>,
+    /// Show moved blocks of code in their own color (`--no-moved` turns it off).
+    pub moved: bool,
     /// With `--listen`: commands from `ribbon send`.
     pub commands: Option<mpsc::Receiver<crate::listen::Request>>,
     /// `ribbon pr`: the pull request, and its checks in one line whenever they are read.
@@ -170,6 +174,9 @@ struct FileState {
     diff: FileDiff,
     old_kinds: Vec<Option<BlockKind>>,
     new_kinds: Vec<Option<BlockKind>>,
+    /// For each line, the moved block it belongs to (an index into the app's moves).
+    old_moved: Vec<Option<usize>>,
+    new_moved: Vec<Option<usize>>,
     old_tokens: Vec<Tokens>,
     new_tokens: Vec<Tokens>,
     added: usize,
@@ -194,11 +201,34 @@ impl FileState {
             new_kinds: kinds(false),
             added: diff.model.blocks.iter().map(|b| b.b1 - b.b0).sum(),
             removed: diff.model.blocks.iter().map(|b| b.a1 - b.a0).sum(),
+            old_moved: vec![None; diff.model.old.len()],
+            new_moved: vec![None; diff.model.new.len()],
             diff,
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
         }
     }
+}
+
+/// Find the moved blocks in all files, and mark their lines.
+fn mark_moves(files: &mut [FileState]) -> Vec<crate::moves::Move> {
+    use crate::moves::{find, Side};
+    let changed: Vec<(Vec<bool>, Vec<bool>)> =
+        files.iter().map(|f| (f.old_kinds.iter().map(Option::is_some).collect(), f.new_kinds.iter().map(Option::is_some).collect())).collect();
+    let sides: Vec<(Side, Side)> = files
+        .iter()
+        .zip(&changed)
+        .map(|(f, (old, new))| (Side { lines: &f.diff.model.old, changed: old }, Side { lines: &f.diff.model.new, changed: new }))
+        .collect();
+    let moves = find(&sides);
+    for file in files.iter_mut() {
+        file.old_moved.iter_mut().chain(file.new_moved.iter_mut()).for_each(|m| *m = None);
+    }
+    for (index, found) in moves.iter().enumerate() {
+        files[found.old_file].old_moved[found.old.clone()].iter_mut().for_each(|m| *m = Some(index));
+        files[found.new_file].new_moved[found.new.clone()].iter_mut().for_each(|m| *m = Some(index));
+    }
+    moves
 }
 
 /// One row of one side of the stream.
@@ -608,6 +638,19 @@ impl Theme {
         if old_side { self.ribbons.delete } else { self.ribbons.insert }
     }
 
+    /// Moved lines: one color on both sides, so a move does not read as a removal and an
+    /// addition.
+    fn moved_color(&self) -> Color {
+        match (self.rgb, self.tint_base) {
+            (None, None) => Color::Magenta,
+            _ => rgb(MOVED),
+        }
+    }
+
+    fn moved_tint(&self) -> Option<Color> {
+        Some(rgb(mix(MOVED, self.tint_base?, ROW_TINT)))
+    }
+
     /// Color for changed line numbers and, without tints, changed text.
     fn change_color(&self, old_side: bool) -> Color {
         match (self.rgb, self.tint_base) {
@@ -712,13 +755,21 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                     (&file.diff.model.new, &file.new_tokens, &file.new_kinds, &file.diff.model.new_inline)
                 };
                 let changed = kinds[index].is_some();
-                let tints = if changed { theme.tints(old_side) } else { None };
+                let moved = (if old_side { &file.old_moved } else { &file.new_moved })[index].is_some();
+                // Moved lines take one tint, with no word marks: their words did not change.
+                let tints = match (changed, moved) {
+                    (true, true) => theme.moved_tint().map(|tint| (tint, tint)),
+                    (true, false) => theme.tints(old_side),
+                    _ => None,
+                };
                 let row_style = match tints {
                     Some((tint, _)) => theme.base().bg(tint),
                     None => theme.base(),
                 };
                 clear(buf, row_area, row_style);
-                let number_style = if changed {
+                let number_style = if moved {
+                    row_style.fg(theme.moved_color())
+                } else if changed {
                     row_style.fg(theme.change_color(old_side))
                 } else {
                     row_style.fg(theme.muted())
@@ -754,12 +805,13 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 let plain = || vec![(Paint::Plain, lines[index].clone())];
                 let line_tokens = tokens.get(index).cloned().unwrap_or_else(plain);
                 let change = changed.then(|| Change {
-                    color: theme.change_color(old_side),
+                    color: if moved { theme.moved_color() } else { theme.change_color(old_side) },
                     strong_bg: tints.map(|(_, strong)| strong),
                     // A whole-line change, or a modified line without word matches, is all changed.
-                    whole_line: inline[index].is_empty(),
+                    whole_line: moved || inline[index].is_empty(),
                 });
-                let spans = skip_columns(styled_tokens(&line_tokens, &inline[index], row_style, change, theme), skip);
+                let words: &[Range<usize>] = if moved { &[] } else { &inline[index] };
+                let spans = skip_columns(styled_tokens(&line_tokens, words, row_style, change, theme), skip);
                 buf.set_line(code_x, y, &Line::from(spans), code_width);
                 let line = &lines[index];
                 let code = (code_x, code_width);
@@ -1041,9 +1093,14 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     }
     let context = if app.whole_file { "c: context" } else { "c: whole file" };
     let text = format!(
-        "{file_part} change {}/{}{}   n/N change  ]/[ file  f files  {context}  a note  }}/{{ notes  z/Z fold  w wrap  s layout  v select  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
+        "{file_part} change {}/{}{}{}   n/N change  ]/[ file  f files  {context}  a note  }}/{{ notes  z/Z fold  w wrap  s layout  v select  e edit  y/Y copy  / search  q quit  </> side  j/k/space scroll",
         app.current_change(),
         app.stream.blocks.len(),
+        match app.moves.len() {
+            0 => String::new(),
+            1 => "  ·  1 move (m)".to_owned(),
+            n => format!("  ·  {n} moves (m)"),
+        },
         if app.hscroll > 0 { format!("  ·  col {}", app.hscroll + 1) } else { String::new() },
     );
     buf.set_line(area.x, area.y, &Line::styled(text, style), area.width);
@@ -1203,6 +1260,9 @@ struct App {
     editor_columns: usize,
     /// `:` was pressed: what has been typed after it, such as `42` or `main.rs:40-52`.
     goto: Option<String>,
+    /// Blocks of code moved from one place to another; empty with `moved = false`.
+    moves: Vec<crate::moves::Move>,
+    find_moves: bool,
     /// The list of notes, with its selected row.
     note_list: Option<usize>,
     /// Lines marked by a `highlight` command.
@@ -1365,6 +1425,9 @@ impl App {
             })
             .collect();
         (self.max_width, self.number_width) = measure(&self.files);
+        if self.find_moves {
+            self.moves = mark_moves(&mut self.files);
+        }
         self.stream = self.build_stream(wrap);
         self.generation += 1;
         self.selection = None;
@@ -2146,6 +2209,12 @@ impl App {
         if last > count {
             return Err(format!("{} has {count} lines{}", self.files[file].diff.new_name, if old_side { " on the old side" } else { "" }));
         }
+        self.select_lines(file, old_side, first, last)
+    }
+
+    /// Select lines (1-based, inclusive) of one version of a file as `v` would, opening their
+    /// folds and scrolling to them.
+    fn select_lines(&mut self, file: usize, old_side: bool, first: usize, last: usize) -> Result<(), String> {
         for line in (first - 1..last).take(2000) {
             self.reveal(file, old_side, line);
         }
@@ -2158,6 +2227,55 @@ impl App {
         self.set_visual_head(end);
         self.follow_row(pane, end);
         Ok(())
+    }
+
+    /// The moved block at the selection, or else the first one on screen.
+    fn move_here(&self) -> Option<(usize, bool)> {
+        let moved_at = |old_side: bool, row: usize| {
+            let (is_old, file, line, _) = self.line_of(old_side, row)?;
+            let state = &self.files[file];
+            (if is_old { &state.old_moved } else { &state.new_moved })[line].map(|m| (m, is_old))
+        };
+        if let Some(selection) = self.selection {
+            let (start, end) = selection.bounds();
+            if let Some(found) = (start.0..=end.0).find_map(|row| moved_at(selection.old_side, row)) {
+                return Some(found);
+            }
+        }
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let panes: &[bool] = match self.panes {
+            Panes::Both if !self.unified => &[true, false],
+            Panes::Old => &[true],
+            _ => &[false],
+        };
+        // The topmost moved line on screen, on either side.
+        panes
+            .iter()
+            .filter_map(|&old_side| {
+                let top = if old_side { left_top } else { right_top };
+                self.shown_rows(old_side, top, self.body_rows.max(1)).into_iter().enumerate().find_map(|(y, row)| moved_at(old_side, row).map(|m| (y, m)))
+            })
+            .min_by_key(|&(y, _)| y)
+            .map(|(_, m)| m)
+    }
+
+    /// `m`: on moved code, select where it went (or where it came from).
+    fn jump_to_other_end(&mut self) {
+        let Some((index, from_old)) = self.move_here() else {
+            self.notice = Some(if self.moves.is_empty() { "no moved code in this diff" } else { "no moved code on screen (it shows in purple)" }.into());
+            return;
+        };
+        let found = self.moves[index].clone();
+        let (file, old_side, range) = if from_old { (found.new_file, false, found.new.clone()) } else { (found.old_file, true, found.old.clone()) };
+        let place = |file: usize, old_side: bool, range: &std::ops::Range<usize>| {
+            let diff = &self.files[file].diff;
+            format!("{}:{}–{}", if old_side { &diff.old_name } else { &diff.new_name }, range.start + 1, range.end)
+        };
+        let message = format!("moved from {} to {}  (m: back)", place(found.old_file, true, &found.old), place(found.new_file, false, &found.new));
+        match self.select_lines(file, old_side, range.start + 1, range.end) {
+            Ok(()) => self.notice = Some(message),
+            Err(problem) => self.notice = Some(problem),
+        }
     }
 
     /// `a`: start a note on the selected lines, or on the line `e` would open.
@@ -2657,6 +2775,10 @@ impl App {
                     }
                     KeyCode::Char('v') => {
                         self.start_visual();
+                        self.position
+                    }
+                    KeyCode::Char('m') => {
+                        self.jump_to_other_end();
                         self.position
                     }
                     KeyCode::Char(':') => {
@@ -3262,7 +3384,8 @@ pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> 
 
 fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, terminal_colors: TermColors) -> anyhow::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
+    let mut files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
+    let moves = if settings.moved { mark_moves(&mut files) } else { Vec::new() };
     let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None, &[], false);
     let mut highlights = spawn_highlighting(&files, &settings.highlighter);
     let (max_width, number_width) = measure(&files);
@@ -3309,6 +3432,8 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         note_draft: None,
         editor_columns: 40,
         goto: None,
+        moves,
+        find_moves: settings.moved,
         note_list: None,
         mark: None,
         pull_request: settings.pull_request.clone(),

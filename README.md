@@ -103,6 +103,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `w` | wrap long lines / scroll them sideways |
 | `s` | split / unified layout (unified: removed lines above the lines that replace them, in one column) |
 | `v` | select whole lines with the keyboard: `j`/`k` extend, `o` goes to the other end, `J`/`K` move the whole selection one line; then `y` copy, `a` note, `Y` change, `e` edit, `Esc` cancel |
+| `m` | on moved code (purple), select where it went, or where it came from |
 | `:` | select lines by number: `:42`, `:40-52`, `:o42` for the old side, `:main.rs:42` for another file (any part of its path). Folds open, and the keys of `v` work on the selection |
 | click a line number | select that line; drag on the numbers or Shift-click another number for more lines. The keys of `v` work on it, so `a` adds a note on exactly those lines |
 | `e` | open `$VISUAL` or `$EDITOR` at the line: the start of the selection, or else the first changed line on screen; the view reloads after the editor closes |
@@ -179,6 +180,7 @@ no ribbon listening, `note` and `finding` write `.ribbon/notes.json` directly.
 - `-U, --context N`: unchanged lines shown around each change (default 3). When a fold hides the line that starts the function (or method, or class) around the next change, that line stays visible inside the fold.
 - `--layout auto|split|unified`: two sides with ribbons, or one column. `auto` (the default) is unified in terminals under 120 columns; `s` switches.
 - `--wrap`: start with long lines wrapped.
+- `--no-moved`: do not mark moved code. By default, a removed block that comes back as added lines elsewhere (in the same file or another one, with any indentation) shows in purple on both sides instead of red and green, like `git diff --color-moved`; `m` selects its other end. A block needs at least 20 letters and digits to count, so a lone `}` is not a move. `moved = false` in the config file turns it off.
 - `--scroll-off N`: rows kept above a change, a match, or a note the view jumps to, and around the end of a keyboard selection (default 3).
 - `--agent-context FILE`: show notes from an agent beside the diff, read-only (Hunk's agent-context JSON).
 - `--listen[=SOCKET]`: take commands from `ribbon send` (see above). `listen = true` in the config file turns it on for every ribbon.

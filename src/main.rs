@@ -17,6 +17,7 @@ mod highlight;
 mod imports;
 mod listen;
 mod model;
+mod moves;
 mod notes;
 mod patch;
 mod search;
@@ -80,6 +81,7 @@ OPTIONS:
     --layout auto|split|unified two sides, or one column with removed lines above added ones;
                                 auto (the default) is unified in terminals under 120 columns
     --wrap                      wrap long lines (the w key switches it)
+    --no-moved                  do not show moved code in its own color
     --scroll-off N              rows kept above a change, match, or note the view jumps to,
                                 and around the keyboard selection (default: 3)
     -U, --context N             unchanged lines shown around each change (default: 3)
@@ -98,6 +100,7 @@ KEYS:
     c                   whole file / changes only
     s                   split / unified layout   v        select lines: j/k extend, o other end,
                                                           J/K move the selection
+    m                   on moved code (purple), select where it went or came from
     :42, :40-52, :o42   select lines of this file (o: old side); :PATH:42 another file
     click a line number select that line (drag or Shift-click for more), then as with v
     z, click a fold     show the hidden lines    Z        fold them again
@@ -162,6 +165,8 @@ struct Options {
     keys: Vec<(config::Key, config::Key)>,
     /// `--listen`: the socket to take commands on; an empty path means the default one.
     listen: Option<PathBuf>,
+    /// Show moved code in its own color.
+    moved: bool,
     /// `ribbon pr`: the pull request shown.
     pull_request: Option<github::PullRequest>,
 }
@@ -203,6 +208,7 @@ fn apply_config(options: &mut Options, table: &toml::Table) -> anyhow::Result<()
             "ignore-imports" => options.ignore_imports = flag(value)?,
             "untracked" => options.untracked = flag(value)?,
             "wrap" => options.wrap = flag(value)?,
+            "moved" => options.moved = flag(value)?,
             "listen" => {
                 options.listen = match value {
                     Value::Boolean(on) => on.then(PathBuf::new),
@@ -248,6 +254,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         keys: Vec::new(),
         listen: None,
         pull_request: None,
+        moved: true,
     };
     let config = config::load()?;
     apply_config(&mut options, &config).with_context(|| format!("in {}", config::path().unwrap_or_default().display()))?;
@@ -287,6 +294,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
                 options.scroll_off = args.next().context("--scroll-off needs a number")?.parse().context("--scroll-off needs a number")?
             }
             "--wrap" => options.wrap = true,
+            "--no-moved" => options.moved = false,
             "--listen" => options.listen = Some(PathBuf::new()),
             _ if arg.starts_with("--listen=") => options.listen = Some(arg["--listen=".len()..].into()),
             _ => options.positional.push(arg),
@@ -947,6 +955,7 @@ fn run() -> anyhow::Result<ExitCode> {
         commands,
         checks,
         pull_request: options.pull_request.clone(),
+        moved: options.moved,
         agent_context: options.agent_context.clone(),
     };
     let mut files = file_diffs(diffs);
