@@ -113,6 +113,9 @@ pub struct Settings {
     pub notice: Option<String>,
     /// With `--listen`: commands from `ribbon send`.
     pub commands: Option<mpsc::Receiver<crate::listen::Request>>,
+    /// `ribbon pr`: the pull request, and its checks in one line whenever they are read.
+    pub pull_request: Option<crate::github::PullRequest>,
+    pub checks: Option<mpsc::Receiver<String>>,
 }
 
 /// Color files in stream order on a background thread; each result redraws. Dropping the
@@ -795,6 +798,8 @@ fn draw_note_row(buf: &mut Buffer, area: Rect, code_x: u16, app: &App, index: us
         Color::Green
     } else if note.status.as_deref() == Some("dismissed") {
         theme.muted()
+    } else if note.status.as_deref() == Some("posted") {
+        Color::Blue
     } else {
         Color::Magenta
     };
@@ -984,10 +989,18 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         (0, all) => format!("{file_part} {all} notes  ·"),
         (open, _) => format!("{file_part} {open} open notes  ·"),
     };
+    let file_part = match (&app.pull_request, &app.checks) {
+        (Some(pr), Some(checks)) => format!(" PR #{}  {checks}  ·{file_part}", pr.number),
+        (Some(pr), None) => format!(" PR #{}  ·{file_part}", pr.number),
+        _ => file_part,
+    };
     let undecided = app.notes.iter().filter(|n| n.is_undecided()).count();
     let file_part = if undecided > 0 { format!("{file_part} {undecided} findings to decide (F)  ·") } else { file_part };
     let on_finding = app.picked_note.filter(|&n| app.notes[n].is_undecided() && app.note_on_screen(n)).is_some();
     let message = match (&app.notice, &app.search) {
+        _ if app.post_confirm.is_some() => app.post_confirm.as_ref().zip(app.pull_request.as_ref()).map(|(notes, pr)| {
+            format!(" post {} notes as a review on PR #{} ({})?   y post  any other key cancels", notes.len(), pr.number, pr.repo)
+        }),
         _ if app.visual && app.notice.is_none() => {
             Some(" VISUAL  j/k extend  y copy  a note  Y change  e edit  Esc cancel".to_owned())
         }
@@ -1176,6 +1189,11 @@ struct App {
     note_list: Option<usize>,
     /// Lines marked by a `highlight` command.
     mark: Option<Mark>,
+    pull_request: Option<crate::github::PullRequest>,
+    /// The pull request's checks, such as "CI ✓ 9 passed".
+    checks: Option<String>,
+    /// `P` asked to post these notes; `y` posts them.
+    post_confirm: Option<Vec<usize>>,
 }
 
 /// Lines marked from outside (`ribbon send highlight`). Kept by name and line, so the mark
@@ -1527,7 +1545,12 @@ impl App {
         };
         match self.files[file].diff.path.clone().filter(|p| p.exists()) {
             Some(path) => self.pending_edit = Some((path, line)),
-            None => self.notice = Some(format!("{} is not a file on disk", self.files[file].diff.new_name)),
+            None => {
+                self.notice = Some(match &self.pull_request {
+                    Some(pr) => format!("to edit, check out the pull request with no changes: gh pr checkout {}", pr.number),
+                    None => format!("{} is not a file on disk", self.files[file].diff.new_name),
+                })
+            }
         }
     }
 
@@ -1653,6 +1676,47 @@ impl App {
                 self.picked_note = None;
                 self.load_notes();
                 self.rebuild(self.stream.wrap);
+            }
+            Err(error) => self.notice = Some(format!("{error:#}")),
+        }
+    }
+
+    /// `P`: ask to post the open notes (the person's, and the findings marked to fix) as a
+    /// review on the pull request.
+    fn ask_to_post(&mut self) {
+        if self.pull_request.is_none() {
+            self.notice = Some("P posts notes to a pull request: open one with ribbon pr NUMBER".into());
+            return;
+        }
+        let notes: Vec<usize> = (0..self.notes.len()).filter(|&n| self.notes[n].is_open()).collect();
+        if notes.is_empty() {
+            self.notice = Some("no open notes to post (a adds one)".into());
+            return;
+        }
+        self.post_confirm = Some(notes);
+    }
+
+    /// Post notes as one review, then mark them "posted" so they are not posted again and
+    /// are no longer tasks for Claude.
+    fn post(&mut self, notes: &[usize]) {
+        let Some(pr) = self.pull_request.clone() else { return };
+        let chosen: Vec<&Note> = notes.iter().filter_map(|&n| self.notes.get(n)).collect();
+        let result = crate::github::commentable(&pr).and_then(|lines| {
+            let (comments, elsewhere) = crate::github::review(&chosen, &lines);
+            let count = comments.len();
+            crate::github::post_review(&pr, comments, &elsewhere).map(|url| (url, count, elsewhere.len()))
+        });
+        match result {
+            Ok((url, on_lines, in_text)) => {
+                let ids: Vec<String> = chosen.iter().filter_map(|n| n.id.clone()).collect();
+                let marked = ids.iter().try_for_each(|id| notes::set_status(&self.notes_file, id, "posted"));
+                self.load_notes();
+                self.rebuild(self.stream.wrap);
+                let text = if in_text > 0 { format!(", {in_text} in the review text (lines not in the diff)") } else { String::new() };
+                self.notice = Some(match marked {
+                    Ok(()) => format!("posted {on_lines} comment{}{text}: {url}", if on_lines == 1 { "" } else { "s" }),
+                    Err(error) => format!("posted ({url}), but could not mark the notes: {error:#}"),
+                });
             }
             Err(error) => self.notice = Some(format!("{error:#}")),
         }
@@ -2170,6 +2234,16 @@ impl App {
             }
             return None;
         }
+        if let (Some(_), Event::Key(key)) = (&self.post_confirm, event) {
+            if key.kind != KeyEventKind::Release {
+                let notes = self.post_confirm.take().unwrap_or_default();
+                self.notice = Some("not posted".into());
+                if key.code == KeyCode::Char('y') {
+                    self.post(&notes);
+                }
+            }
+            return None;
+        }
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Release {
                 self.notice = None;
@@ -2289,6 +2363,10 @@ impl App {
                             Some(note) => self.delete_note(note),
                             None => self.notice = Some("go to a note with } or { first".into()),
                         }
+                        self.position
+                    }
+                    KeyCode::Char('P') => {
+                        self.ask_to_post();
                         self.position
                     }
                     KeyCode::Char(key @ ('F' | 'D')) => {
@@ -2822,6 +2900,9 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         note_draft: None,
         note_list: None,
         mark: None,
+        pull_request: settings.pull_request.clone(),
+        checks: None,
+        post_confirm: None,
     };
     app.load_notes();
     // The view opens on the first change.
@@ -2928,6 +3009,9 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
                 if app.reload(diffs) {
                     highlights = spawn_highlighting(&app.files, &settings.highlighter);
                 }
+                break;
+            } else if let Some(line) = settings.checks.as_ref().and_then(|c| c.try_recv().ok()) {
+                app.checks = Some(line);
                 break;
             } else if let Some(request) = settings.commands.as_ref().and_then(|c| c.try_recv().ok()) {
                 // The client gave up on it (the editor was open): doing it now would surprise.

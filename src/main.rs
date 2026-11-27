@@ -11,6 +11,7 @@
 mod config;
 mod context;
 mod git;
+mod github;
 mod ribbons;
 mod highlight;
 mod imports;
@@ -46,6 +47,7 @@ USAGE:
     ribbon [OPTIONS] OLD NEW              two files, or two folders (git difftool --dir-diff)
     ribbon show [COMMIT] [-- PATHS]       one commit, like `git show` (default: HEAD)
     ribbon stash [STASH] [-- PATHS]       one stash, like `git stash show -p`
+    ribbon pr [NUMBER|URL] [-- PATHS]     a pull request, with `gh` (default: this branch's)
     ribbon FILE.patch | ribbon -          a patch file, or a patch on stdin:
                                           git show | ribbon, or as git's pager:
                                           git config pager.diff ribbon
@@ -101,6 +103,7 @@ KEYS:
     y (no selection)    copy: p path, a absolute path, f file name, l path:line, c change
     Y                   copy the change as a patch (one side alone: its lines)
     a                   add a note for Claude on the selected or first changed line
+    P                   (ribbon pr) post the open notes as a review on the pull request
     } / {               next/prev note          A        all notes      x  delete note
     F / D               on a review finding: fix it (Claude does) / dismiss it; then the next
 
@@ -151,6 +154,8 @@ struct Options {
     keys: Vec<(config::Key, config::Key)>,
     /// `--listen`: the socket to take commands on; an empty path means the default one.
     listen: Option<PathBuf>,
+    /// `ribbon pr`: the pull request shown.
+    pull_request: Option<github::PullRequest>,
 }
 
 fn parse_layout(text: &str) -> anyhow::Result<LayoutMode> {
@@ -234,6 +239,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         layout: LayoutMode::Auto,
         keys: Vec::new(),
         listen: None,
+        pull_request: None,
     };
     let config = config::load()?;
     apply_config(&mut options, &config).with_context(|| format!("in {}", config::path().unwrap_or_default().display()))?;
@@ -777,7 +783,20 @@ fn run() -> anyhow::Result<ExitCode> {
         print!("{SKILL}");
         return Ok(ExitCode::SUCCESS);
     }
-    if let Some((args, about)) = subcommand(&options.positional) {
+    if options.positional.first().is_some_and(|c| c == "pr") {
+        let rest = &options.positional[1..];
+        let (which, rest) = match rest.first() {
+            Some(first) if first != "--" => (Some(first.as_str()), &rest[1..]),
+            _ => (None, rest),
+        };
+        let pr = github::view(which)?;
+        github::fetch(&pr)?;
+        let mut args = github::diff_args(&pr);
+        args.extend(rest.iter().cloned());
+        options.positional = args;
+        notice = Some(format!("PR #{} {}", pr.number, pr.title));
+        options.pull_request = Some(pr);
+    } else if let Some((args, about)) = subcommand(&options.positional) {
         options.positional = args;
         notice = about;
     } else if let Some(text) = read_patch(&options.positional)? {
@@ -859,6 +878,19 @@ fn run() -> anyhow::Result<ExitCode> {
             Some(Box::new(move || load(&options, &highlighter, false).map(file_diffs).unwrap_or_default()))
         }
     };
+    // Checks change while the view is open: ask every 30 seconds.
+    let checks = options.pull_request.clone().map(|pr| {
+        let (sender, checks) = mpsc::channel();
+        std::thread::spawn(move || loop {
+            if let Some(line) = github::checks(&pr) {
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        checks
+    });
     let settings = Settings {
         graphics: options.graphics.or_else(auto_graphics),
         kitty_hint: kitty_hint(),
@@ -874,9 +906,19 @@ fn run() -> anyhow::Result<ExitCode> {
         keys: options.keys.clone(),
         notes_file: notes::notes_file(&top),
         commands,
+        checks,
+        pull_request: options.pull_request.clone(),
         agent_context: options.agent_context.clone(),
     };
-    let files = file_diffs(diffs);
+    let mut files = file_diffs(diffs);
+    // The editor opens the working-tree file: only when it is the pull request's version.
+    if let Some(pr) = &options.pull_request {
+        let checked_out = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == pr.head);
+        let clean = std::process::Command::new("git").args(["diff", "--quiet", "HEAD"]).status().is_ok_and(|s| s.success());
+        if !(checked_out && clean) {
+            files.iter_mut().for_each(|f| f.path = None);
+        }
+    }
     Ok(match ui::run(files, settings)? {
         Outcome::Quit => ExitCode::SUCCESS,
         Outcome::QuitAll => ExitCode::from(1),

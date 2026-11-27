@@ -46,6 +46,24 @@ A patch from git names the file versions on its `index` lines; ribbon reads the 
 from git when it can, so `c` shows whole files. Otherwise it shows only what the patch has.
 As a pager, input that is not a diff is printed as it is.
 
+A pull request, with the [GitHub CLI](https://cli.github.com):
+
+```sh
+ribbon pr 123                            # or a URL; no number: this branch's pull request
+ribbon pr 123 -- '*.ts'                  # only some files
+```
+
+ribbon fetches the pull request's commits when the clone does not have them (only
+`FETCH_HEAD` changes) and shows what the pull request page shows: the head against the point
+where it left the base. The status line shows the checks, read again every 30 seconds, such as
+`CI ✗ 1 failed (lint) · 12 passed`. `e` opens the editor only when the pull request is checked
+out with no local changes.
+
+`P` posts your open notes, and the findings marked to fix, as one review on the pull request,
+after you press `y` to confirm. Each note becomes a comment on its lines; a note on lines the
+pull request page does not show goes into the review text with its path and line. Posted notes
+show `posted` and are no longer tasks for Claude.
+
 Outside git mode:
 
 ```sh
@@ -86,6 +104,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `}` / `{` | next / previous note |
 | `A` | list of all notes (`Enter` goes to one, `x` deletes it) |
 | `x` | delete the note picked with `}` / `{` |
+| `P` | in `ribbon pr`: post the open notes as a review on the pull request (asks first) |
 | `F` / `D` | on a code-review finding: fix it (Claude does) / dismiss it, then go to the next one; with no finding picked, go to the next one |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |

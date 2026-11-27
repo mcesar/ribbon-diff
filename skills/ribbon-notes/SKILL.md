@@ -40,7 +40,8 @@ reads the file again every second, so your changes to it show at once.
   move when code is edited: when they no longer match, find the line by its anchor text (the
   copy nearest to the range).
 - `summary` is the note. `author` is `"you"` for the person's notes.
-- `status` is `"open"` or `"done"`. A missing status means open.
+- `status` is `"open"` or `"done"`. A missing status means open. `"posted"` means the person
+  posted the note to a pull request on GitHub (`P` in `ribbon pr`): it is not a task for you.
 
 ## Act on the open notes
 
