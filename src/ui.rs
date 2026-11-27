@@ -47,6 +47,11 @@ const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// alternate screen and popped before leaving it, since each screen keeps its own flags.
 const KEYS_ON: &str = "\x1b[>13u";
 const KEYS_OFF: &str = "\x1b[<u";
+/// While typing: only "disambiguate" from the Kitty keyboard protocol, so Shift-Enter can be
+/// told from Enter while text still arrives as text (composed characters stay whole).
+const KEYS_TYPING: &str = "\x1b[<u\x1b[>1u\x1b[?2004h";
+/// Back from typing: bracketed paste off, and the full key reports again.
+const KEYS_TYPED: &str = "\x1b[?2004l\x1b[<u\x1b[>13u";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Graphics {
@@ -1013,12 +1018,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
             Some(" VISUAL  j/k extend  o other end  J/K move  y copy  a note  Y change  e edit  Esc cancel".to_owned())
         }
         _ if app.copy_menu => Some(" copy:  p path  a absolute path  f file name  l path:line  c change   Esc cancel".to_owned()),
-        _ if app.note_draft.is_some() => app.note_draft.as_ref().map(|d| {
-            let lines = if d.range.0 == d.range.1 { format!("{}", d.range.0) } else { format!("{}-{}", d.range.0, d.range.1) };
-            let side = if d.old_side { " (old side)" } else { "" };
-            let post = if app.pull_request.is_some() { "  Ctrl-P post now" } else { "" };
-            format!(" note on {}:{lines}{side}: {}█   Enter save{post}  Esc cancel", d.path, d.text)
-        }),
+        _ if app.note_draft.is_some() => Some(" typing a note".to_owned()),
         (Some(notice), _) => Some(format!(" {notice}")),
         (None, Some(found)) if found.editing => {
             Some(format!(" /{}█   {} matches   Enter done  Esc cancel", found.query, found.matches.len()))
@@ -1196,6 +1196,8 @@ struct App {
     picked_note: Option<usize>,
     /// A note being typed.
     note_draft: Option<Draft>,
+    /// Text columns of the note editor, from the last frame.
+    editor_columns: usize,
     /// The list of notes, with its selected row.
     note_list: Option<usize>,
     /// Lines marked by a `highlight` command.
@@ -1231,7 +1233,69 @@ struct Draft {
     /// 1-based, inclusive.
     range: (usize, usize),
     anchor: String,
-    text: String,
+    text: crate::textarea::TextArea,
+    /// The screen row of the note's last line when typing started, to keep it in sight.
+    line_y: Option<u16>,
+}
+
+/// Where the note editor sits: up to 90 columns wide, tall enough for its text, just below
+/// the line the note is on, or above it when there is no room below.
+fn note_editor_area(area: Rect, text_rows: usize, line_y: Option<u16>) -> Rect {
+    let width = area.width.saturating_sub(4).min(90).max(20.min(area.width));
+    let height = (text_rows.clamp(3, 16) as u16 + 2).min(area.height.saturating_sub(2)).max(3.min(area.height));
+    // The last row is the status line.
+    let bottom = area.y + area.height.saturating_sub(1);
+    let y = match line_y {
+        Some(line) if line + 1 + height <= bottom => line + 1,
+        Some(line) if line >= area.y + height => line - height,
+        _ => area.y + (area.height.saturating_sub(height)) / 3,
+    };
+    Rect::new(area.x + (area.width - width) / 2, y, width, height)
+}
+
+/// Text columns inside the note editor: its width less the border and a space on each side.
+fn note_editor_columns(area: Rect) -> usize {
+    note_editor_area(area, 0, None).width.saturating_sub(4) as usize
+}
+
+/// The note being typed, in a box over the diff, with a cursor.
+fn draw_note_editor(buf: &mut Buffer, area: Rect, app: &App, draft: &Draft) {
+    use ratatui::widgets::{Block, Widget};
+    let columns = note_editor_columns(area);
+    let rows = draft.text.rows(columns);
+    let editor = note_editor_area(area, rows.len(), draft.line_y);
+    let frame = match app.theme.rgb {
+        Some(_) => app.theme.panel(),
+        None => Style::default().bg(Color::Black).fg(Color::Reset),
+    };
+    clear(buf, editor, frame);
+    let lines = if draft.range.0 == draft.range.1 { format!("{}", draft.range.0) } else { format!("{}–{}", draft.range.0, draft.range.1) };
+    let side = if draft.old_side { " (old side)" } else { "" };
+    let post = if app.pull_request.is_some() { " · Ctrl-P post now" } else { "" };
+    Block::bordered()
+        .border_style(frame.fg(Color::Yellow))
+        .title(Line::styled(format!(" note on {}:{lines}{side} ", draft.path), frame.add_modifier(Modifier::BOLD)))
+        .title_bottom(Line::styled(format!(" Enter save · Shift-Enter new line{post} · Esc cancel "), frame.fg(app.theme.muted())))
+        .render(editor, buf);
+    let (cursor_row, cursor_column) = draft.text.cursor_place(columns);
+    let visible = editor.height.saturating_sub(2) as usize;
+    let first = cursor_row.saturating_sub(visible.saturating_sub(1));
+    let x = editor.x + 2;
+    for (screen_row, &row) in rows.iter().enumerate().skip(first).take(visible).map(|(i, r)| (i - first, r)) {
+        let y = editor.y + 1 + screen_row as u16;
+        buf.set_line(x, y, &Line::styled(draft.text.row_text(row), frame), columns as u16);
+    }
+    if draft.text.is_blank() && cursor_row == 0 {
+        buf.set_line(x + 1, editor.y + 1, &Line::styled("What should change here?", frame.fg(app.theme.muted()).add_modifier(Modifier::ITALIC)), columns as u16 - 1);
+    }
+    // The cursor: the cell under it reversed.
+    let (cx, cy) = (x + cursor_column.min(columns) as u16, editor.y + 1 + (cursor_row - first) as u16);
+    if let Some(cell) = buf.cell_mut((cx, cy)) {
+        if cell.symbol().trim().is_empty() {
+            cell.set_symbol(" ");
+        }
+        cell.modifier.insert(Modifier::REVERSED);
+    }
 }
 
 impl App {
@@ -2027,68 +2091,93 @@ impl App {
             return;
         };
         let path = if old_side { diff.old_name.clone() } else { diff.new_name.clone() };
-        self.note_draft = Some(Draft { path, old_side, range: (first + 1, last + 1), anchor, text: String::new() });
-        // Plain keys while typing: the Kitty keyboard protocol can split composed characters.
-        let _ = io::stdout().write_all(KEYS_OFF.as_bytes());
+        // The screen row of the last line, so the editor does not cover it.
+        let line_y = self.line_row(file, old_side, last).and_then(|(pane, row)| {
+            let (left_top, right_top) = self.stream.scroll.tops(self.position);
+            let top = if pane { left_top } else { right_top };
+            let area = if pane { self.sides.0 } else { self.sides.1 };
+            (row >= top && row < top + self.body_rows).then(|| area.y + (row - top) as u16)
+        });
+        self.note_draft = Some(Draft { path, old_side, range: (first + 1, last + 1), anchor, text: Default::default(), line_y });
+        let _ = io::stdout().write_all(KEYS_TYPING.as_bytes());
     }
 
     /// Typing a note.
-    fn apply_draft_key(&mut self, key: &KeyEvent) {
+    /// Typing a note. Enter saves; Shift-Enter (or Alt-Enter, or Ctrl-J, for terminals that
+    /// don't tell Shift-Enter apart) starts a new line; Ctrl-P saves and posts it at once in
+    /// `ribbon pr`; Esc cancels.
+    fn apply_draft_key(&mut self, key: &KeyEvent, columns: usize) {
         if key.kind == KeyEventKind::Release {
             return;
         }
         let Some(draft) = &mut self.note_draft else { return };
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let (ctrl, alt, shift) = (key.modifiers.contains(KeyModifiers::CONTROL), key.modifiers.contains(KeyModifiers::ALT), key.modifiers.contains(KeyModifiers::SHIFT));
+        let text = &mut draft.text;
         match key.code {
             KeyCode::Esc => {}
             KeyCode::Char('c') if ctrl => {}
-            KeyCode::Enter if draft.text.trim().is_empty() => {}
-            KeyCode::Char('p') if ctrl && draft.text.trim().is_empty() => return,
-            KeyCode::Enter | KeyCode::Char('p') if key.code == KeyCode::Enter || (ctrl && self.pull_request.is_some()) => {
-                // Ctrl-P (or Ctrl-Enter or Alt-Enter, where the terminal sends them) posts at once.
-                let post_now = self.pull_request.is_some() && (key.code == KeyCode::Char('p') || key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
-                let note = Note {
-                    id: Some(notes::new_id()),
-                    path: draft.path.clone(),
-                    old_side: draft.old_side,
-                    range: draft.range,
-                    anchor: Some(draft.anchor.clone()),
-                    summary: draft.text.trim().to_owned(),
-                    rationale: None,
-                    author: Some("you".into()),
-                    status: Some("open".into()),
-                    reply: None,
-                    editable: true,
-                };
-                match notes::add(&self.notes_file, &note) {
-                    Ok(()) => {
-                        self.notice = Some(format!("note saved in {}", self.notes_file.display()));
-                        self.selection = None;
-                        self.load_notes();
-                        self.rebuild(self.stream.wrap);
-                        self.picked_note = self.notes.iter().position(|n| n.id == note.id);
-                        if let Some(index) = self.picked_note.filter(|_| post_now) {
-                            self.post_now(index);
-                        }
-                    }
-                    Err(error) => {
-                        self.notice = Some(format!("{error:#}"));
-                        return;
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                draft.text.pop();
-                return;
-            }
-            KeyCode::Char(c) if !ctrl => {
-                draft.text.push(c);
-                return;
-            }
+            KeyCode::Enter if shift || alt => return text.insert('\n'),
+            KeyCode::Char('j') if ctrl => return text.insert('\n'),
+            KeyCode::Enter | KeyCode::Char('p') if text.is_blank() => return,
+            KeyCode::Enter if !ctrl => return self.save_draft(false),
+            // Ctrl-P (or Ctrl-Enter, where the terminal sends it) posts at once.
+            KeyCode::Enter | KeyCode::Char('p') if ctrl && self.pull_request.is_some() => return self.save_draft(true),
+            KeyCode::Enter => return self.save_draft(false),
+            KeyCode::Backspace if ctrl || alt => return text.delete_word(),
+            KeyCode::Char('w') if ctrl => return text.delete_word(),
+            KeyCode::Backspace => return text.backspace(),
+            KeyCode::Delete => return text.delete(),
+            KeyCode::Left => return text.left(),
+            KeyCode::Right => return text.right(),
+            KeyCode::Up => return text.vertical(columns, false),
+            KeyCode::Down => return text.vertical(columns, true),
+            KeyCode::Home => return text.home(columns),
+            KeyCode::Char('a') if ctrl => return text.home(columns),
+            KeyCode::End => return text.end(columns),
+            KeyCode::Char('e') if ctrl => return text.end(columns),
+            KeyCode::Tab => return text.insert_str("\t"),
+            KeyCode::Char(c) if !ctrl => return text.insert(c),
             _ => return,
         }
+        self.close_draft();
+    }
+
+    fn close_draft(&mut self) {
         self.note_draft = None;
-        let _ = io::stdout().write_all(KEYS_ON.as_bytes());
+        let _ = io::stdout().write_all(KEYS_TYPED.as_bytes());
+    }
+
+    /// Save the note being typed, and with `post_now` post it to the pull request too.
+    fn save_draft(&mut self, post_now: bool) {
+        let Some(draft) = self.note_draft.take() else { return };
+        let note = Note {
+            id: Some(notes::new_id()),
+            path: draft.path.clone(),
+            old_side: draft.old_side,
+            range: draft.range,
+            anchor: Some(draft.anchor.clone()),
+            summary: draft.text.text().trim().to_owned(),
+            rationale: None,
+            author: Some("you".into()),
+            status: Some("open".into()),
+            reply: None,
+            editable: true,
+        };
+        if let Err(error) = notes::add(&self.notes_file, &note) {
+            // Keep the text, so nothing typed is lost.
+            self.note_draft = Some(draft);
+            self.notice = Some(format!("{error:#}"));
+            return;
+        }
+        self.close_draft();
+        self.notice = Some(format!("note saved in {}", self.notes_file.display()));
+        self.selection = None;
+        self.load_notes();
+        self.rebuild(self.stream.wrap);
+        self.picked_note = self.notes.iter().position(|n| n.id == note.id);
+        if let Some(index) = self.picked_note.filter(|_| post_now) {
+            self.post_now(index);
+        }
     }
 
     fn apply_note_list(&mut self, key: &KeyEvent, selected: usize) {
@@ -2370,9 +2459,14 @@ impl App {
             self.apply_note_list(key, selected);
             return None;
         }
-        if self.note_draft.is_some() {
-            if let Event::Key(key) = event {
-                self.apply_draft_key(key);
+        if let Some(draft) = &mut self.note_draft {
+            match event {
+                Event::Key(key) => {
+                    let columns = self.editor_columns;
+                    self.apply_draft_key(key, columns);
+                }
+                Event::Paste(text) => draft.text.insert_str(text),
+                _ => {}
             }
             return None;
         }
@@ -2946,6 +3040,7 @@ pub fn restore_terminal(graphics: Graphics) {
     }
     let _ = out.write_all(MOUSE_OFF.as_bytes());
     let _ = out.write_all(KEYS_OFF.as_bytes());
+    let _ = out.write_all(b"\x1b[?2004l");
     let _ = execute!(out, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
 }
@@ -3107,6 +3202,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         note_width: 0,
         picked_note: None,
         note_draft: None,
+        editor_columns: 40,
         note_list: None,
         mark: None,
         pull_request: settings.pull_request.clone(),
@@ -3147,6 +3243,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
             app.rebuild(wrap_width);
         }
         app.note_width = note_width;
+        app.editor_columns = note_editor_columns(area);
         let max = app.stream.scroll.max_position(body_rows);
         app.position = app.position.min(max);
         let (left_top, right_top) = app.stream.scroll.tops(app.position);
@@ -3177,11 +3274,14 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
             if let Some(selected) = app.picker {
                 draw_picker(buf, area, &app, selected);
             }
+            if let Some(draft) = &app.note_draft {
+                draw_note_editor(buf, area, &app, draft);
+            }
         })?;
 
         if graphics == Graphics::Kitty {
             // The lists cover the ribbon column, so the image comes down while one is open.
-            let wanted = (app.picker.is_none() && app.note_list.is_none()).then_some((app.whole_file, app.generation, view));
+            let wanted = (app.picker.is_none() && app.note_list.is_none() && app.note_draft.is_none()).then_some((app.whole_file, app.generation, view));
             if wanted != last_image {
                 let backend = term.backend_mut();
                 match wanted {

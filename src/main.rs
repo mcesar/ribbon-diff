@@ -22,6 +22,7 @@ mod patch;
 mod search;
 mod select;
 mod termcolors;
+mod textarea;
 mod ui;
 
 use anyhow::Context;
@@ -106,7 +107,8 @@ KEYS:
     e                   open in $EDITOR at the selected or first changed line
     y (no selection)    copy: p path, a absolute path, f file name, l path:line, c change
     Y                   copy the change as a patch (one side alone: its lines)
-    a                   add a note for Claude on the selected or first changed line
+    a                   add a note for Claude on the selected or first changed line, in a box:
+                        Enter saves, Shift-Enter (or Alt-Enter, Ctrl-J) starts a new line
     P                   (ribbon pr) review: comment, approve, or request changes, with the
                         open notes as comments; Ctrl-P while typing a note posts it at once
     } / {               next/prev note          A        all notes      x  delete note

@@ -111,7 +111,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `y` / `Esc` | copy the selection again / clear it |
 | `y` with no selection | copy: `p` path, `a` absolute path, `f` file name, `l` path:line, `c` the change |
 | `Y` | copy the current change (or the one with the selection) as a patch; with one side alone, that side's lines |
-| `a` | add a note for Claude on the selected lines, or the line `e` would open |
+| `a` | add a note for Claude on the selected lines, or the line `e` would open. It opens a box next to the line: `Enter` saves, `Shift-Enter` starts a new line (`Alt-Enter` or `Ctrl-J` where the terminal does not send Shift-Enter), arrows move, pasted text keeps its lines, `Esc` cancels |
 | `}` / `{` | next / previous note |
 | `A` | list of all notes (`Enter` goes to one, `x` deletes it) |
 | `x` | delete the note picked with `}` / `{` |
