@@ -14,6 +14,7 @@ mod git;
 mod ribbons;
 mod highlight;
 mod imports;
+mod listen;
 mod model;
 mod notes;
 mod patch;
@@ -50,6 +51,7 @@ USAGE:
                                           git config pager.diff ribbon
     ribbon PATH OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE [NEW-PATH INFO]
                                           (as GIT_EXTERNAL_DIFF)
+    ribbon send COMMAND ...               control a ribbon started with --listen (below)
 
     Git mode passes everything it does not know to `git diff`: commits and ranges,
     --cached, and pathspecs after --. For example:
@@ -68,6 +70,8 @@ OPTIONS:
     --watch[=INTERVAL]          reload when the files change (git and two-path modes); checks
                                 every second, or every INTERVAL such as 500ms or 2s
     --agent-context FILE        show notes from an agent beside the diff (Hunk's format)
+    --listen[=SOCKET]           take commands from `ribbon send` on a local socket
+                                (default: .ribbon/ribbon.sock at the top of the repository)
     --layout auto|split|unified two sides, or one column with removed lines above added ones;
                                 auto (the default) is unified in terminals under 120 columns
     --wrap                      wrap long lines (the w key switches it)
@@ -98,11 +102,26 @@ KEYS:
     Y                   copy the change as a patch (one side alone: its lines)
     a                   add a note for Claude on the selected or first changed line
     } / {               next/prev note          A        all notes      x  delete note
+    F / D               on a review finding: fix it (Claude does) / dismiss it; then the next
 
 CONFIG:
     ~/.config/ribbon/config.toml sets defaults with the long option names, such as
     context = 5, ignore-comments = true, layout = \"split\", watch = \"500ms\". A [keys] table
     makes one key act as another: \"ctrl-d\" = \"pagedown\". The command line wins over the file.
+
+SEND (to a ribbon started with --listen; lines are 1-based, --old means the old version):
+    ribbon send navigate PATH[:LINE]          scroll to a file or a line
+    ribbon send highlight PATH:FIRST[-LAST]   mark lines and scroll to them
+    ribbon send clear                         remove the mark
+    ribbon send reload                        read the files and notes again
+    ribbon send note PATH:FIRST[-LAST] TEXT [--rationale TEXT] [--author NAME]
+                                              add a note (author: claude)
+    ribbon send finding PATH:FIRST[-LAST] TEXT [--rationale TEXT]
+                                              add a code-review finding to fix or dismiss
+    ribbon send status                        where the view is, as JSON
+    ribbon send 'JSON'                        one request as JSON
+    Options: --old, --socket PATH. With no ribbon listening, note and finding write
+    .ribbon/notes.json directly.
 
 NOTES:
     Notes are kept in .ribbon/notes.json at the top of the repository, and show again when
@@ -130,6 +149,8 @@ struct Options {
     layout: LayoutMode,
     /// Keys from the config file: a key, and the key it acts as.
     keys: Vec<(config::Key, config::Key)>,
+    /// `--listen`: the socket to take commands on; an empty path means the default one.
+    listen: Option<PathBuf>,
 }
 
 fn parse_layout(text: &str) -> anyhow::Result<LayoutMode> {
@@ -169,6 +190,12 @@ fn apply_config(options: &mut Options, table: &toml::Table) -> anyhow::Result<()
             "ignore-imports" => options.ignore_imports = flag(value)?,
             "untracked" => options.untracked = flag(value)?,
             "wrap" => options.wrap = flag(value)?,
+            "listen" => {
+                options.listen = match value {
+                    Value::Boolean(on) => on.then(PathBuf::new),
+                    _ => Some(text(value)?.into()),
+                }
+            }
             "watch" => {
                 options.watch = match value {
                     Value::Boolean(on) => on.then_some(Duration::from_secs(1)),
@@ -206,6 +233,7 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         wrap: false,
         layout: LayoutMode::Auto,
         keys: Vec::new(),
+        listen: None,
     };
     let config = config::load()?;
     apply_config(&mut options, &config).with_context(|| format!("in {}", config::path().unwrap_or_default().display()))?;
@@ -245,6 +273,8 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
                 options.scroll_off = args.next().context("--scroll-off needs a number")?.parse().context("--scroll-off needs a number")?
             }
             "--wrap" => options.wrap = true,
+            "--listen" => options.listen = Some(PathBuf::new()),
+            _ if arg.starts_with("--listen=") => options.listen = Some(arg["--listen=".len()..].into()),
             _ => options.positional.push(arg),
         }
     }
@@ -630,7 +660,115 @@ fn spawn_watcher(options: Options, highlighter: Arc<Highlighter>, interval: Dura
     reloads
 }
 
+/// A path from the command line as the diff names it: relative to the top of the repository.
+fn repo_path(arg: &str, top: &Path) -> String {
+    let given = Path::new(arg);
+    let absolute = if given.is_absolute() { given.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(given) };
+    // Resolve symlinks (/tmp is /private/tmp on macOS) on the longest part that exists.
+    let resolved = absolute.canonicalize().ok().or_else(|| Some(absolute.parent()?.canonicalize().ok()?.join(absolute.file_name()?)));
+    let top = top.canonicalize().unwrap_or_else(|_| top.to_path_buf());
+    resolved
+        .and_then(|path| path.strip_prefix(&top).ok().map(|p| p.to_string_lossy().into_owned()))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| arg.to_owned())
+}
+
+/// `PATH`, `PATH:LINE`, or `PATH:FIRST-LAST`.
+fn path_and_lines(arg: &str) -> anyhow::Result<(&str, Option<(usize, usize)>)> {
+    let Some((path, lines)) = arg.rsplit_once(':').filter(|(_, l)| l.chars().next().is_some_and(|c| c.is_ascii_digit())) else {
+        return Ok((arg, None));
+    };
+    let number = |n: &str| n.parse::<usize>().ok().filter(|&n| n >= 1).with_context(|| format!("{arg:?}: lines are 1-based numbers, like {path}:12 or {path}:12-20"));
+    let (first, last) = match lines.split_once('-') {
+        Some((first, last)) => (number(first)?, number(last)?),
+        None => (number(lines)?, number(lines)?),
+    };
+    if first > last {
+        anyhow::bail!("{arg:?}: the first line comes after the last");
+    }
+    Ok((path, Some((first, last))))
+}
+
+/// `ribbon send ...`: one request to a listening ribbon. Prints the reply as JSON.
+fn send(args: &[String]) -> anyhow::Result<ExitCode> {
+    let top = git::top_level().unwrap_or_else(|_| PathBuf::from("."));
+    let (mut socket, mut old, mut rationale, mut author) = (None, false, None, None);
+    let mut words = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--socket" => socket = Some(PathBuf::from(rest.next().context("--socket needs a path")?)),
+            "--old" => old = true,
+            "--rationale" => rationale = Some(rest.next().context("--rationale needs text")?.clone()),
+            "--author" => author = Some(rest.next().context("--author needs a name")?.clone()),
+            _ => words.push(arg.as_str()),
+        }
+    }
+    let socket = socket.or_else(|| std::env::var_os("RIBBON_SOCKET").map(PathBuf::from)).unwrap_or_else(|| listen::socket_file(&top));
+    let side = if old { "old" } else { "new" };
+    let lines = |arg: Option<&&str>, needed: bool| -> anyhow::Result<(String, Option<(usize, usize)>)> {
+        let arg = arg.context("needs PATH:LINE, like src/main.rs:12 or src/main.rs:12-20")?;
+        let (path, lines) = path_and_lines(arg)?;
+        if needed && lines.is_none() {
+            anyhow::bail!("{arg:?} needs lines, like {arg}:12 or {arg}:12-20");
+        }
+        Ok((repo_path(path, &top), lines))
+    };
+    let request = match words.as_slice() {
+        [json] if json.trim_start().starts_with('{') => serde_json::from_str(json).context("not valid JSON")?,
+        ["navigate", target] => {
+            let (path, lines) = lines(Some(target), false)?;
+            serde_json::json!({ "command": "navigate", "path": path, "side": side, "line": lines.map(|l| l.0) })
+        }
+        ["highlight", target] => {
+            let (path, lines) = lines(Some(target), true)?;
+            let (first, last) = lines.unwrap_or_default();
+            serde_json::json!({ "command": "highlight", "path": path, "side": side, "range": [first, last] })
+        }
+        [command @ ("clear" | "reload" | "status")] => serde_json::json!({ "command": command }),
+        [command @ ("note" | "finding"), target, text @ ..] if !text.is_empty() => {
+            let (path, lines) = lines(Some(target), true)?;
+            let (first, last) = lines.unwrap_or_default();
+            let mut request = serde_json::json!({ "command": command, "path": path, "side": side, "range": [first, last], "summary": text.join(" ") });
+            if let Some(rationale) = &rationale {
+                request["rationale"] = rationale.clone().into();
+            }
+            if let Some(author) = &author {
+                request["author"] = author.clone().into();
+            }
+            request
+        }
+        _ => anyhow::bail!("usage: ribbon send navigate|highlight|clear|reload|note|finding|status ... (see ribbon --help)"),
+    };
+    let reply = match listen::send(&socket, &request) {
+        Ok(reply) => reply,
+        // Without a viewer, a note still goes into the notes file; ribbon shows it when it opens.
+        Err(_) if matches!(request["command"].as_str(), Some("note" | "finding")) => write_note(&top, &request)?,
+        Err(error) => return Err(error),
+    };
+    println!("{reply}");
+    Ok(if reply["ok"] == true { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+/// Add a note to `.ribbon/notes.json` when no ribbon listens. The anchor comes from the file
+/// on disk, so it is only set for the new side.
+fn write_note(top: &Path, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let listen::Command::Note { path, old_side, range, summary, rationale, author, status } = listen::parse(&request.to_string())? else {
+        anyhow::bail!("not a note");
+    };
+    let anchor = (!old_side).then(|| std::fs::read_to_string(top.join(&path)).ok()).flatten().and_then(|text| model::split_lines(&text).get(range.1 - 1).cloned());
+    let id = notes::new_id();
+    let note = notes::Note { id: Some(id.clone()), path, old_side, range, anchor, summary, rationale, author: Some(author), status, reply: None, editable: true };
+    notes::add(&notes::notes_file(top), &note)?;
+    Ok(listen::ok(serde_json::json!({ "id": id, "written": "notes file (no ribbon listening)" })))
+}
+
 fn run() -> anyhow::Result<ExitCode> {
+    // Before the options: `ribbon send` has its own, and its stdin is not a patch.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "send") {
+        return send(&args[1..]);
+    }
     let Some(mut options) = parse_args()? else {
         return Ok(ExitCode::SUCCESS);
     };
@@ -697,6 +835,21 @@ fn run() -> anyhow::Result<ExitCode> {
         };
     }
 
+    // A ribbon that can't listen (another one does already) still shows the diff, and says so.
+    let top = git::top_level().unwrap_or_else(|_| PathBuf::from("."));
+    let (commands, _listening) = match &options.listen {
+        Some(path) => {
+            let path = if path.as_os_str().is_empty() { listen::socket_file(&top) } else { path.clone() };
+            match listen::listen(&path) {
+                Ok((commands, listening)) => (Some(commands), Some(listening)),
+                Err(error) => {
+                    notice = Some(format!("not listening: {error:#}"));
+                    (None, None)
+                }
+            }
+        }
+        None => (None, None),
+    };
     let reloads = watch.map(|interval| spawn_watcher(options.clone(), Arc::clone(&highlighter), interval, last));
     // After the editor closes, read the files again (a patch or git's temporary files can't be).
     let load_again: Option<Box<dyn Fn() -> Vec<FileDiff>>> = match source(&options) {
@@ -719,7 +872,8 @@ fn run() -> anyhow::Result<ExitCode> {
         wrap: options.wrap,
         layout: options.layout,
         keys: options.keys.clone(),
-        notes_file: notes::notes_file(&git::top_level().unwrap_or_else(|_| PathBuf::from("."))),
+        notes_file: notes::notes_file(&top),
+        commands,
         agent_context: options.agent_context.clone(),
     };
     let files = file_diffs(diffs);

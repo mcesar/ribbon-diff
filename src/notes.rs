@@ -9,6 +9,9 @@
 //! Ranges are 1-based and inclusive; `oldRange` puts a note on the old side. Ribbon's own
 //! notes add `id`, `status` ("open" or "done"), `reply`, and `anchor` (the text of the range's
 //! last line, to find the line again after edits move it). Hunk ignores those fields.
+//!
+//! Findings from a code review are notes with `author` "review". Their status starts "new";
+//! the person sets it to "open" (Claude fixes it, then marks it "done") or "dismissed".
 
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
@@ -35,12 +38,27 @@ pub struct Note {
 impl Note {
     /// A note from the person that is not done yet. Claude's own notes explain its changes
     /// and are never open.
+    /// A finding the person chose to fix is open too.
     pub fn is_open(&self) -> bool {
-        self.editable && self.is_from_person() && self.status.as_deref().unwrap_or("open") == "open"
+        self.editable && (self.is_from_person() || self.is_finding()) && self.status.as_deref().unwrap_or(if self.is_finding() { "new" } else { "open" }) == "open"
     }
 
-    /// The status to show: the one written, or "open" for the person's notes without one.
+    /// A finding from a code review (author "review") that the person has not decided on:
+    /// fix it, or dismiss it.
+    pub fn is_undecided(&self) -> bool {
+        self.editable && self.is_finding() && self.status.as_deref().unwrap_or("new") == "new"
+    }
+
+    pub fn is_finding(&self) -> bool {
+        self.author.as_deref() == Some("review")
+    }
+
+    /// The status to show: the one written, or "open" for the person's notes without one,
+    /// or "new" for a finding without one.
     pub fn state(&self) -> Option<&str> {
+        if self.is_finding() && self.editable {
+            return Some(self.status.as_deref().unwrap_or("new"));
+        }
         self.status.as_deref().or((self.editable && self.is_from_person()).then_some("open"))
     }
 
@@ -139,6 +157,7 @@ pub fn add(path: &Path, note: &Note) -> anyhow::Result<()> {
         (if note.old_side { "oldRange" } else { "newRange" }): [note.range.0, note.range.1],
         "anchor": note.anchor,
         "summary": note.summary,
+        "rationale": note.rationale,
         "author": note.author,
         "status": note.status,
     });
@@ -160,6 +179,16 @@ pub fn add(path: &Path, note: &Note) -> anyhow::Result<()> {
                 }
             }
             None => files.push(json!({ "path": note.path, "annotations": [annotation] })),
+        }
+    })
+}
+
+/// Set a note's status, such as "open" or "dismissed" for a finding.
+pub fn set_status(path: &Path, id: &str, status: &str) -> anyhow::Result<()> {
+    change(path, |root| {
+        let notes = root.get_mut("files").and_then(Value::as_array_mut).into_iter().flatten().filter_map(|f| f.get_mut("annotations").and_then(Value::as_array_mut)).flatten();
+        for note in notes.filter(|a| a.get("id").and_then(Value::as_str) == Some(id)) {
+            note["status"] = json!(status);
         }
     })
 }

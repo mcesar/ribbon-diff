@@ -111,6 +111,8 @@ pub struct Settings {
     pub agent_context: Option<PathBuf>,
     /// Shown in the status line at the start, such as the commit for `ribbon show`.
     pub notice: Option<String>,
+    /// With `--listen`: commands from `ribbon send`.
+    pub commands: Option<mpsc::Receiver<crate::listen::Request>>,
 }
 
 /// Color files in stream order on a background thread; each result redraws. Dropping the
@@ -724,7 +726,21 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                     };
                     format!("{sign}{:<width$}", index + 1, width = number_width as usize - 1)
                 };
-                if part == 0 {
+                // Lines marked with `ribbon send highlight` show their numbers in reverse cyan.
+                let marked = app.mark.as_ref().is_some_and(|m| {
+                    if m.old_side == old_side {
+                        *(if old_side { &file.diff.old_name } else { &file.diff.new_name }) == m.path && (m.range.0..=m.range.1).contains(&(index + 1))
+                    } else {
+                        // The unified column shows unchanged old lines as their new lines.
+                        app.unified
+                            && m.old_side
+                            && file.diff.old_name == m.path
+                            && (m.range.0 - 1..m.range.1).take(2000).any(|old| file.diff.model.new_line_outside_changes(old) == Some(index))
+                    }
+                });
+                let number_style = if marked { number_style.bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD) } else { number_style };
+                if part == 0 || marked {
+                    let number = if part == 0 { number } else { " ".repeat(number_width as usize) };
                     buf.set_line(number_x, y, &Line::styled(number, number_style), number_width);
                 }
                 let plain = || vec![(Paint::Plain, lines[index].clone())];
@@ -770,10 +786,15 @@ fn draw_note_row(buf: &mut Buffer, area: Rect, code_x: u16, app: &App, index: us
     let panel = theme.panel();
     clear(buf, area, panel);
     // Open notes from the person are yellow, done ones green, and notes from agents magenta.
+    // Findings from a code review that wait for a decision are cyan, dismissed ones grey.
     let accent = if note.is_open() {
         Color::Yellow
+    } else if note.is_undecided() {
+        Color::Cyan
     } else if note.status.as_deref() == Some("done") {
         Color::Green
+    } else if note.status.as_deref() == Some("dismissed") {
+        theme.muted()
     } else {
         Color::Magenta
     };
@@ -963,6 +984,9 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         (0, all) => format!("{file_part} {all} notes  ·"),
         (open, _) => format!("{file_part} {open} open notes  ·"),
     };
+    let undecided = app.notes.iter().filter(|n| n.is_undecided()).count();
+    let file_part = if undecided > 0 { format!("{file_part} {undecided} findings to decide (F)  ·") } else { file_part };
+    let on_finding = app.picked_note.filter(|&n| app.notes[n].is_undecided() && app.note_on_screen(n)).is_some();
     let message = match (&app.notice, &app.search) {
         _ if app.visual && app.notice.is_none() => {
             Some(" VISUAL  j/k extend  y copy  a note  Y change  e edit  Esc cancel".to_owned())
@@ -983,6 +1007,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
             found.matches.len(),
             found.query
         )),
+        (None, None) if on_finding => Some(format!("{file_part} finding:  F fix (Claude does it)  D dismiss  }}/{{ other notes")),
         (None, None) => None,
     };
     if let Some(message) = message {
@@ -1012,7 +1037,7 @@ fn draw_note_list(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
         None => Style::default().bg(Color::Black).fg(Color::Reset),
     };
     clear(buf, Rect::new(x, y, width, height), frame);
-    let title = format!(" {} notes  (Enter go to, x delete, Esc close)", app.notes.len());
+    let title = format!(" {} notes  (Enter go to, x delete, F/D fix/dismiss a finding, Esc close)", app.notes.len());
     buf.set_line(x, y, &Line::styled(title, frame.add_modifier(Modifier::BOLD)), width);
     let rows = (height - 2) as usize;
     let first = selected.saturating_sub(rows.saturating_sub(1));
@@ -1149,6 +1174,18 @@ struct App {
     note_draft: Option<Draft>,
     /// The list of notes, with its selected row.
     note_list: Option<usize>,
+    /// Lines marked by a `highlight` command.
+    mark: Option<Mark>,
+}
+
+/// Lines marked from outside (`ribbon send highlight`). Kept by name and line, so the mark
+/// stays when the rows are built again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mark {
+    path: String,
+    old_side: bool,
+    /// 1-based, inclusive.
+    range: (usize, usize),
 }
 
 /// A note being typed: where it goes, and its text so far.
@@ -1621,6 +1658,194 @@ impl App {
         }
     }
 
+    /// `F` and `D`: mark a finding to fix ("open") or dismiss it, then go to the next one.
+    fn decide(&mut self, note: usize, status: &str, advance: bool) {
+        let Some(found) = self.notes.get(note) else { return };
+        let (true, Some(id)) = (found.is_finding() && found.editable, found.id.clone()) else {
+            self.notice = Some("F and D act on findings from a code review".into());
+            return;
+        };
+        if let Err(error) = notes::set_status(&self.notes_file, &id, status) {
+            self.notice = Some(format!("{error:#}"));
+            return;
+        }
+        self.load_notes();
+        self.rebuild(self.stream.wrap);
+        self.picked_note = self.notes.iter().position(|n| n.id.as_deref() == Some(&id));
+        let left = self.notes.iter().filter(|n| n.is_undecided()).count();
+        let done = if status == "open" { "to fix" } else { "dismissed" };
+        if advance && left > 0 {
+            self.next_finding();
+        }
+        self.notice = Some(match left {
+            0 => format!("finding {done}; all decided: ask Claude to fix the open ones"),
+            _ => format!("finding {done}; {left} left  (F fix  D dismiss)"),
+        });
+    }
+
+    /// The next finding that waits for a decision, after the picked note; at the end, the
+    /// first one.
+    fn next_finding(&mut self) {
+        let mut order: Vec<(usize, usize)> = (0..self.notes.len())
+            .filter(|&n| self.notes[n].is_undecided())
+            .filter_map(|n| self.note_row(n).map(|(old_side, row)| (self.stream.scroll.position_of_row(row, old_side), n)))
+            .collect();
+        order.sort();
+        let here = self.picked_note.and_then(|n| self.note_row(n)).map_or(self.position, |(old_side, row)| self.stream.scroll.position_of_row(row, old_side));
+        match order.iter().find(|&&(p, n)| p > here || (p == here && Some(n) != self.picked_note)).or(order.first()) {
+            Some(&(_, note)) => {
+                self.go_to_note(note);
+                self.notice = Some("finding:  F fix (Claude does it)  D dismiss".into());
+            }
+            None if self.notes.iter().any(|n| n.is_undecided()) => self.notice = Some("the findings are on files not in this diff (A lists them)".into()),
+            None => self.notice = Some("no findings to decide".into()),
+        }
+    }
+
+    /// The file a command names: by its name on that side, or else the one file whose name
+    /// ends with it.
+    fn file_named(&self, path: &str, old_side: bool) -> Result<usize, String> {
+        let name = |f: &FileState| if old_side { f.diff.old_name.clone() } else { f.diff.new_name.clone() };
+        if let Some(file) = self.files.iter().position(|f| name(f) == path) {
+            return Ok(file);
+        }
+        let ending = format!("/{}", path.trim_start_matches("./"));
+        let found: Vec<usize> = (0..self.files.len()).filter(|&f| name(&self.files[f]).ends_with(&ending)).collect();
+        match found.as_slice() {
+            [file] => Ok(*file),
+            [] => Err(format!("{path} is not in this diff")),
+            _ => Err(format!("{path} names {} files in this diff; give more of the path", found.len())),
+        }
+    }
+
+    /// The pane and stream row of a line (zero-based) of one version of a file, if shown.
+    fn line_row(&self, file: usize, old_side: bool, line: usize) -> Option<(bool, usize)> {
+        if !self.stream.unified {
+            return self.rows(old_side).iter().position(|r| *r == Row::Line(file, line)).map(|row| (old_side, row));
+        }
+        // The unified column shows old lines only inside changes; others sit at their new line.
+        let model = &self.files[file].diff.model;
+        let target = match old_side.then(|| model.new_line_outside_changes(line)) {
+            Some(Some(new_line)) => Row::Line(file, new_line),
+            Some(None) => Row::Old(file, line, 0),
+            None => Row::Line(file, line),
+        };
+        self.stream.right.iter().position(|r| *r == target).map(|row| (false, row))
+    }
+
+    /// Show a line that a fold hides. Returns false when it can't be shown.
+    fn reveal(&mut self, file: usize, old_side: bool, line: usize) -> bool {
+        if self.line_row(file, old_side, line).is_some() {
+            return true;
+        }
+        let model = &self.files[file].diff.model;
+        let Some(new_line) = (if old_side { model.new_line_outside_changes(line) } else { Some(line) }) else { return false };
+        let fold = self.stream.right.iter().find_map(|r| match *r {
+            Row::Fold(f, hidden, start) if f == file && start <= new_line && new_line < start.saturating_add(hidden) => Some(start),
+            _ => None,
+        });
+        match fold {
+            Some(start) => {
+                self.open_fold(file, start);
+                self.line_row(file, old_side, line).is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// Scroll to a file, or to a line (zero-based) of it, opening its fold and showing its side.
+    fn navigate(&mut self, file: usize, old_side: bool, line: Option<usize>) -> Result<(), String> {
+        let model = &self.files[file].diff.model;
+        let count = if old_side { model.old.len() } else { model.new.len() };
+        if let Some(line) = line.filter(|&l| l >= count) {
+            return Err(format!("line {} is past the end ({count} lines)", line + 1));
+        }
+        // The unified column holds both versions.
+        if !self.stream.unified && ((old_side && self.panes == Panes::New) || (!old_side && self.panes == Panes::Old)) {
+            self.panes = Panes::Both;
+        }
+        let row = match line {
+            Some(line) if self.reveal(file, old_side, line) => self.line_row(file, old_side, line),
+            _ => None,
+        };
+        self.position = match row {
+            Some((pane, row)) => self.stream.scroll.position_of_row(row, pane).saturating_sub(self.scroll_off + 1),
+            None => self.stream.scroll.position_of_row(self.header_row(file, old_side), old_side),
+        };
+        Ok(())
+    }
+
+    /// A command from `ribbon send`. Reloading is left to the event loop, which owns the
+    /// loader and the colors.
+    fn command(&mut self, command: crate::listen::Command) -> serde_json::Value {
+        use crate::listen::{error, ok, Command};
+        use serde_json::json;
+        match command {
+            Command::Navigate { path, old_side, line } => {
+                match self.file_named(&path, old_side).and_then(|file| self.navigate(file, old_side, line.map(|l| l - 1))) {
+                    Ok(()) => ok(json!({})),
+                    Err(problem) => error(problem),
+                }
+            }
+            Command::Highlight { path, old_side, range } => {
+                let file = match self.file_named(&path, old_side) {
+                    Ok(file) => file,
+                    Err(problem) => return error(problem),
+                };
+                // Open every fold the range crosses, up to a sane size.
+                for line in (range.0 - 1..range.1).take(2000) {
+                    self.reveal(file, old_side, line);
+                }
+                if let Err(problem) = self.navigate(file, old_side, Some(range.0 - 1)) {
+                    return error(problem);
+                }
+                let diff = &self.files[file].diff;
+                let path = if old_side { diff.old_name.clone() } else { diff.new_name.clone() };
+                self.mark = Some(Mark { path, old_side, range });
+                ok(json!({}))
+            }
+            Command::Clear => {
+                self.mark = None;
+                ok(json!({}))
+            }
+            Command::Note { path, old_side, range, summary, rationale, author, status } => {
+                // A note on a file that is not in the diff is kept, and shows when the file does.
+                let (path, anchor, shown) = match self.file_named(&path, old_side) {
+                    Ok(file) => {
+                        let diff = &self.files[file].diff;
+                        let (name, lines) = if old_side { (&diff.old_name, &diff.model.old) } else { (&diff.new_name, &diff.model.new) };
+                        (name.clone(), lines.get(range.1 - 1).cloned(), true)
+                    }
+                    Err(_) => (path, None, false),
+                };
+                let id = notes::new_id();
+                let note = Note { id: Some(id.clone()), path, old_side, range, anchor, summary, rationale, author: Some(author), status, reply: None, editable: true };
+                if let Err(problem) = notes::add(&self.notes_file, &note) {
+                    return error(format!("{problem:#}"));
+                }
+                self.load_notes();
+                self.rebuild(self.stream.wrap);
+                // Ids are milliseconds: two notes in the same one would share an id.
+                std::thread::sleep(Duration::from_millis(2));
+                ok(json!({ "id": id, "in_diff": shown }))
+            }
+            Command::Status => {
+                let focus = self.focus().map(|(file, line)| json!({ "path": self.files[file].diff.new_name, "line": line + 1 }));
+                let file = self.current_file();
+                ok(json!({
+                    "file": self.files.get(file).map(|f| f.diff.new_name.clone()),
+                    "focus": focus,
+                    "files": self.files.len(),
+                    "changes": self.stream.blocks.len(),
+                    "open_notes": self.notes.iter().filter(|n| n.is_open()).count(),
+                    "findings_to_decide": self.notes.iter().filter(|n| n.is_undecided()).count(),
+                    "highlight": self.mark.as_ref().map(|m| json!({ "path": m.path, "side": if m.old_side { "old" } else { "new" }, "range": [m.range.0, m.range.1] })),
+                }))
+            }
+            Command::Reload => error("reload is handled by the event loop"),
+        }
+    }
+
     /// `a`: start a note on the selected lines, or on the line `e` would open.
     fn start_note(&mut self) {
         let place = match self.selection {
@@ -1719,6 +1944,10 @@ impl App {
             KeyCode::Char('x') => {
                 self.delete_note(selected);
                 (!self.notes.is_empty()).then(|| selected.min(self.notes.len() - 1))
+            }
+            KeyCode::Char(key @ ('F' | 'D')) => {
+                self.decide(selected, if key == 'F' { "open" } else { "dismissed" }, false);
+                Some(selected)
             }
             KeyCode::Char('j') | KeyCode::Down => Some((selected + 1).min(last)),
             KeyCode::Char('k') | KeyCode::Up => Some(selected.saturating_sub(1)),
@@ -2059,6 +2288,13 @@ impl App {
                         match self.picked_note.filter(|&n| self.note_on_screen(n)) {
                             Some(note) => self.delete_note(note),
                             None => self.notice = Some("go to a note with } or { first".into()),
+                        }
+                        self.position
+                    }
+                    KeyCode::Char(key @ ('F' | 'D')) => {
+                        match self.picked_note.filter(|&n| self.notes[n].is_undecided() && self.note_on_screen(n)) {
+                            Some(note) => self.decide(note, if key == 'F' { "open" } else { "dismissed" }, true),
+                            None => self.next_finding(),
                         }
                         self.position
                     }
@@ -2585,6 +2821,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         picked_note: None,
         note_draft: None,
         note_list: None,
+        mark: None,
     };
     app.load_notes();
     // The view opens on the first change.
@@ -2691,6 +2928,29 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
                 if app.reload(diffs) {
                     highlights = spawn_highlighting(&app.files, &settings.highlighter);
                 }
+                break;
+            } else if let Some(request) = settings.commands.as_ref().and_then(|c| c.try_recv().ok()) {
+                // The client gave up on it (the editor was open): doing it now would surprise.
+                if std::time::Instant::now() > request.deadline {
+                    continue;
+                }
+                let reply = match request.command {
+                    crate::listen::Command::Reload => match &settings.load_again {
+                        Some(load) => {
+                            let diffs = load();
+                            let changed = !diffs.is_empty();
+                            if app.reload(diffs) {
+                                highlights = spawn_highlighting(&app.files, &settings.highlighter);
+                            }
+                            app.load_notes();
+                            app.rebuild(app.stream.wrap);
+                            if changed { crate::listen::ok(serde_json::json!({ "files": app.files.len() })) } else { crate::listen::error("no changes now; the view keeps the old ones") }
+                        }
+                        None => crate::listen::error("this diff came from a patch or from git's temporary files; it can't be read again"),
+                    },
+                    command => app.command(command),
+                };
+                let _ = request.reply.send(reply);
                 break;
             }
         }

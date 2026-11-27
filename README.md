@@ -86,6 +86,7 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `}` / `{` | next / previous note |
 | `A` | list of all notes (`Enter` goes to one, `x` deletes it) |
 | `x` | delete the note picked with `}` / `{` |
+| `F` / `D` | on a code-review finding: fix it (Claude does) / dismiss it, then go to the next one; with no finding picked, go to the next one |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |
 
@@ -107,8 +108,36 @@ To install the skill:
 mkdir -p ~/.claude/skills/ribbon-notes && ribbon skill > ~/.claude/skills/ribbon-notes/SKILL.md
 ```
 
+### Code-review findings
+
+After a code review, Claude can put each finding on its lines with `ribbon send finding` (the
+skill tells it to). A finding is a cyan note that waits for a decision. Press `F` to go to the
+first one, then `F` again to have Claude fix it or `D` to dismiss it; ribbon goes on to the next
+one. Then ask Claude to handle the notes: it fixes the findings you marked and replies on each.
+
 The file uses [Hunk](https://github.com/modem-dev/hunk)'s agent-context format, so Hunk can read
 it too. `--agent-context FILE` shows such a file from another tool, read-only.
+
+## Claude controls the view
+
+`ribbon --listen` takes commands on a local socket, `.ribbon/ribbon.sock` at the top of the
+repository (or a short path under `/tmp` when that path is too long for a socket). `ribbon send`
+is the client, so Claude can show you the line it talks about:
+
+```sh
+ribbon send navigate src/main.rs:120         # scroll to a line, opening its fold
+ribbon send highlight src/main.rs:120-131    # mark lines (cyan line numbers) and scroll there
+ribbon send clear                            # remove the mark
+ribbon send reload                           # read the files and notes again
+ribbon send note src/main.rs:120 "Why this changed" --rationale "..." [--author NAME]
+ribbon send finding src/main.rs:120-131 "A problem" --rationale "How it fails"
+ribbon send status                           # the file and line on screen, as JSON
+ribbon send '{"command":"navigate","path":"src/main.rs","line":120}'
+```
+
+`--old` puts the lines on the old version; `--socket PATH` (or `RIBBON_SOCKET`) picks another
+socket. Each request and reply is one line of JSON, so any program can talk to the socket. With
+no ribbon listening, `note` and `finding` write `.ribbon/notes.json` directly.
 
 ## Options
 
@@ -120,6 +149,7 @@ it too. `--agent-context FILE` shows such a file from another tool, read-only.
 - `--wrap`: start with long lines wrapped.
 - `--scroll-off N`: rows kept above a change, a match, or a note the view jumps to, and around the end of a keyboard selection (default 3).
 - `--agent-context FILE`: show notes from an agent beside the diff, read-only (Hunk's agent-context JSON).
+- `--listen[=SOCKET]`: take commands from `ribbon send` (see above). `listen = true` in the config file turns it on for every ribbon.
 - `--graphics auto|kitty|blocks`: how to draw ribbons. `auto` asks the terminal if it shows Kitty graphics.
 - `--theme NAME`: syntect theme (default `base16-ocean.dark`).
 - `--name PATH`: display name, also used to pick the syntax.

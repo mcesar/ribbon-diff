@@ -1,6 +1,6 @@
 ---
 name: ribbon-notes
-description: Act on the notes a person left on a diff in ribbon (the side-by-side terminal diff viewer), and explain your own code changes with notes they see beside the code. Use when the user says they left notes, comments, or review remarks in ribbon, mentions .ribbon/notes.json, asks you to explain your changes in ribbon, or when you change code in a repository that has a .ribbon folder.
+description: Act on the notes a person left on a diff in ribbon (the side-by-side terminal diff viewer), explain your own code changes with notes they see beside the code, show code-review findings in ribbon, and move the person's ribbon view with `ribbon send`. Use when the user says they left notes, comments, or review remarks in ribbon, mentions .ribbon/notes.json, asks you to explain your changes in ribbon, asks you to show something in ribbon, runs a code review in a repository that has a .ribbon folder, or when you change code in such a repository.
 ---
 
 # Notes in ribbon
@@ -45,7 +45,8 @@ reads the file again every second, so your changes to it show at once.
 ## Act on the open notes
 
 1. Read `.ribbon/notes.json`. The open notes are the ones with `author` `"you"` and a status
-   that is `"open"` or missing.
+   that is `"open"` or missing, and the findings (`author` `"review"`) with status `"open"`:
+   the person chose to fix those.
 2. For each open note, read the code at its range, then do what it asks. A question needs an
    answer, not a code change.
 3. Then update that note:
@@ -94,6 +95,48 @@ reply. Skip changes too small to need a reason, such as a typo fix.
 
 ribbon shows each note under the last line of its range. A note on a line inside a fold opens
 that fold.
+
+## Code-review findings
+
+In a repository with a `.ribbon` folder, after a code review (`/code-review`, `/review`, or a
+review the person asks for), also put each finding in ribbon, so the person can go through them
+beside the code. Add one per finding, after you report them:
+
+```sh
+ribbon send finding src/search.ts:40-52 "Sorts after the slice, so page 2 repeats items." \
+  --rationale "With 30 results and a page size of 20, page 2 shows items 1-10 again."
+```
+
+- The range is the lines the finding is about, in the new version (`--old` for removed lines).
+- The text is one sentence about the problem; `--rationale` holds the failure scenario.
+- It is a note with `"author": "review"` and `"status": "new"`. Without a listening ribbon,
+  `ribbon send finding` writes it to the notes file itself, so it works either way.
+
+In ribbon, the person presses `F` on each finding to have you fix it (status `"open"`) or `D`
+to dismiss it (status `"dismissed"`). When they ask you to handle the notes, fix the `"open"`
+findings as in "Act on the open notes": set `"done"` and a `"reply"`. Never fix a finding that
+is still `"new"` or `"dismissed"`.
+
+## Control the view
+
+When the person runs `ribbon --listen`, you can move their view. Lines are 1-based; paths can
+be relative to the current folder or to the top of the repository; `--old` means the old
+version. Each command prints a JSON reply; `"ok": false` has an `"error"`.
+
+```sh
+ribbon send navigate src/search.ts:40        # scroll to a line (or just a file)
+ribbon send highlight src/search.ts:40-52    # mark lines and scroll to them
+ribbon send clear                            # remove the mark
+ribbon send reload                           # read the files and notes again
+ribbon send note src/search.ts:40-52 "Retries three times." --rationale "Why."
+ribbon send status                           # the file and line on screen, open notes, findings
+```
+
+Use `navigate` or `highlight` when you explain code to the person ("this is the line that
+fails"), and `reload` after you change files when ribbon does not run with `--watch`. `note`
+adds a note with `"author": "claude"`, like the notes in "Explain your own changes". When
+nothing listens, `navigate`, `highlight`, `clear`, `reload`, and `status` fail with "no ribbon
+listens": do not start ribbon yourself; it needs the person's terminal.
 
 ## Notes from other tools
 
