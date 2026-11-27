@@ -1019,6 +1019,9 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         }
         _ if app.copy_menu => Some(" copy:  p path  a absolute path  f file name  l path:line  c change   Esc cancel".to_owned()),
         _ if app.note_draft.is_some() => Some(" typing a note".to_owned()),
+        _ if app.goto.is_some() => {
+            app.goto.as_ref().map(|text| format!(" :{text}█   line: 42  lines: 40-52  old side: o42  other file: main.rs:42   Enter go  Esc cancel"))
+        }
         (Some(notice), _) => Some(format!(" {notice}")),
         (None, Some(found)) if found.editing => {
             Some(format!(" /{}█   {} matches   Enter done  Esc cancel", found.query, found.matches.len()))
@@ -1198,6 +1201,8 @@ struct App {
     note_draft: Option<Draft>,
     /// Text columns of the note editor, from the last frame.
     editor_columns: usize,
+    /// `:` was pressed: what has been typed after it, such as `42` or `main.rs:40-52`.
+    goto: Option<String>,
     /// The list of notes, with its selected row.
     note_list: Option<usize>,
     /// Lines marked by a `highlight` command.
@@ -1236,6 +1241,30 @@ struct Draft {
     text: crate::textarea::TextArea,
     /// The screen row of the note's last line when typing started, to keep it in sight.
     line_y: Option<u16>,
+}
+
+/// What follows `:`: an optional path and colon, an optional `o` for the old side, then a
+/// line or a range of lines (1-based).
+fn parse_goto(text: &str) -> Result<(Option<&str>, bool, (usize, usize)), String> {
+    let text = text.trim();
+    let (path, lines) = match text.rsplit_once(':') {
+        Some((path, lines)) => (Some(path.trim()).filter(|p| !p.is_empty()), lines.trim()),
+        None => (None, text),
+    };
+    let (old_side, lines) = match lines.strip_prefix('o') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, lines),
+    };
+    let number = |n: &str| n.trim().parse::<usize>().ok().filter(|&n| n >= 1);
+    let range = match lines.split_once(['-', ',']) {
+        Some((a, b)) => number(a).zip(number(b)),
+        None => number(lines).map(|n| (n, n)),
+    };
+    match range {
+        Some((first, last)) if first <= last => Ok((path, old_side, (first, last))),
+        Some(_) => Err("the first line comes after the last".into()),
+        None => Err(format!("{text:?}: type a line (42), lines (40-52), o42 for the old side, or PATH:42")),
+    }
 }
 
 /// Where the note editor sits: up to 90 columns wide, tall enough for its text, just below
@@ -2065,6 +2094,72 @@ impl App {
         }
     }
 
+    /// Typing after `:`.
+    fn apply_goto_key(&mut self, key: &KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let Some(text) = &mut self.goto else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.goto = None,
+            KeyCode::Char('c') if ctrl => self.goto = None,
+            KeyCode::Backspace if text.is_empty() => self.goto = None,
+            KeyCode::Backspace => {
+                text.pop();
+            }
+            KeyCode::Enter => {
+                let text = self.goto.take().unwrap_or_default();
+                if let Err(problem) = self.go_to_lines(&text) {
+                    self.notice = Some(problem);
+                }
+            }
+            KeyCode::Char(c) if !ctrl => text.push(c),
+            _ => {}
+        }
+    }
+
+    /// `:` then `42`, `40-52`, `o42` (old side), or `PATH:42`: select those lines of the
+    /// current file (or of the file whose path matches), opening their folds, as `v` would.
+    fn go_to_lines(&mut self, text: &str) -> Result<(), String> {
+        let (path, old_side, (first, last)) = parse_goto(text)?;
+        let file = match path {
+            None => self.current_file(),
+            Some(path) => self.file_named(path, old_side).or_else(|exact| {
+                // Words of the path in any order, as the file list matches.
+                let words: Vec<String> = path.to_lowercase().split(['/', ' ']).filter(|w| !w.is_empty()).map(str::to_owned).collect();
+                let found: Vec<usize> = (0..self.files.len())
+                    .filter(|&f| {
+                        let name = if old_side { &self.files[f].diff.old_name } else { &self.files[f].diff.new_name }.to_lowercase();
+                        words.iter().all(|w| name.contains(w.as_str()))
+                    })
+                    .collect();
+                match found.as_slice() {
+                    [file] => Ok(*file),
+                    [] => Err(exact),
+                    _ => Err(format!("{path} matches {} files; give more of the path", found.len())),
+                }
+            })?,
+        };
+        let model = &self.files[file].diff.model;
+        let count = if old_side { model.old.len() } else { model.new.len() };
+        if last > count {
+            return Err(format!("{} has {count} lines{}", self.files[file].diff.new_name, if old_side { " on the old side" } else { "" }));
+        }
+        for line in (first - 1..last).take(2000) {
+            self.reveal(file, old_side, line);
+        }
+        self.navigate(file, old_side, Some(first - 1))?;
+        let (Some((pane, start)), Some((_, end))) = (self.line_row(file, old_side, first - 1), self.line_row(file, old_side, last - 1)) else {
+            return Err("those lines are not shown".into());
+        };
+        self.visual = true;
+        self.visual_anchor = (pane, start);
+        self.set_visual_head(end);
+        self.follow_row(pane, end);
+        Ok(())
+    }
+
     /// `a`: start a note on the selected lines, or on the line `e` would open.
     fn start_note(&mut self) {
         let place = match self.selection {
@@ -2476,6 +2571,12 @@ impl App {
             }
             return None;
         }
+        if self.goto.is_some() {
+            if let Event::Key(key) = event {
+                self.apply_goto_key(key);
+            }
+            return None;
+        }
         let remapped = self.remap(event);
         let event = &remapped;
         if let Event::Mouse(mouse) = event {
@@ -2556,6 +2657,10 @@ impl App {
                     }
                     KeyCode::Char('v') => {
                         self.start_visual();
+                        self.position
+                    }
+                    KeyCode::Char(':') => {
+                        self.goto = Some(String::new());
                         self.position
                     }
                     KeyCode::Char('}') => {
@@ -3203,6 +3308,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         picked_note: None,
         note_draft: None,
         editor_columns: 40,
+        goto: None,
         note_list: None,
         mark: None,
         pull_request: settings.pull_request.clone(),
@@ -3440,6 +3546,18 @@ mod tests {
         let next = |rows: &[Row]| at(rows, Row::Line(0, 20));
         let (l, r) = stream.scroll.tops(stream.scroll.position_of_row(next(right), false));
         assert_eq!((l, r), (next(left), next(right)));
+    }
+
+    #[test]
+    fn reads_what_follows_the_colon() {
+        assert_eq!(parse_goto("42"), Ok((None, false, (42, 42))));
+        assert_eq!(parse_goto(" 40-52 "), Ok((None, false, (40, 52))));
+        assert_eq!(parse_goto("o7"), Ok((None, true, (7, 7))));
+        assert_eq!(parse_goto("src/main.rs:3,5"), Ok((Some("src/main.rs"), false, (3, 5))));
+        assert_eq!(parse_goto("main:o9"), Ok((Some("main"), true, (9, 9))));
+        assert!(parse_goto("9-3").is_err());
+        assert!(parse_goto("0").is_err());
+        assert!(parse_goto("main.rs").is_err());
     }
 
     #[test]
