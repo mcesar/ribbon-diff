@@ -998,8 +998,16 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
     let file_part = if undecided > 0 { format!("{file_part} {undecided} findings to decide (F)  ·") } else { file_part };
     let on_finding = app.picked_note.filter(|&n| app.notes[n].is_undecided() && app.note_on_screen(n)).is_some();
     let message = match (&app.notice, &app.search) {
-        _ if app.post_confirm.is_some() => app.post_confirm.as_ref().zip(app.pull_request.as_ref()).map(|(notes, pr)| {
-            format!(" post {} notes as a review on PR #{} ({})?   y post  any other key cancels", notes.len(), pr.number, pr.repo)
+        _ if app.review.is_some() => app.review.as_ref().zip(app.pull_request.as_ref()).map(|(review, pr)| {
+            let notes = match review.notes.len() {
+                0 => "no notes".to_owned(),
+                1 => "1 note as a comment".to_owned(),
+                n => format!("{n} notes as comments"),
+            };
+            match review.verdict {
+                None => format!(" review PR #{} ({}) with {notes}:   c comment  a approve  r request changes   Esc cancel", pr.number, pr.repo),
+                Some(verdict) => format!(" {} · summary (optional): {}█   Enter post  Esc cancel", verdict.name(), review.summary),
+            }
         }),
         _ if app.visual && app.notice.is_none() => {
             Some(" VISUAL  j/k extend  o other end  J/K move  y copy  a note  Y change  e edit  Esc cancel".to_owned())
@@ -1008,7 +1016,8 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         _ if app.note_draft.is_some() => app.note_draft.as_ref().map(|d| {
             let lines = if d.range.0 == d.range.1 { format!("{}", d.range.0) } else { format!("{}-{}", d.range.0, d.range.1) };
             let side = if d.old_side { " (old side)" } else { "" };
-            format!(" note on {}:{lines}{side}: {}█   Enter save  Esc cancel", d.path, d.text)
+            let post = if app.pull_request.is_some() { "  Ctrl-P post now" } else { "" };
+            format!(" note on {}:{lines}{side}: {}█   Enter save{post}  Esc cancel", d.path, d.text)
         }),
         (Some(notice), _) => Some(format!(" {notice}")),
         (None, Some(found)) if found.editing => {
@@ -1194,8 +1203,15 @@ struct App {
     pull_request: Option<crate::github::PullRequest>,
     /// The pull request's checks, such as "CI ✓ 9 passed".
     checks: Option<String>,
-    /// `P` asked to post these notes; `y` posts them.
-    post_confirm: Option<Vec<usize>>,
+    /// A review being made with `P`.
+    review: Option<ReviewDraft>,
+}
+
+/// `P`: the notes to post, then the verdict picked, then the summary typed.
+struct ReviewDraft {
+    notes: Vec<usize>,
+    verdict: Option<crate::github::Verdict>,
+    summary: String,
 }
 
 /// Lines marked from outside (`ribbon send highlight`). Kept by name and line, so the mark
@@ -1683,45 +1699,118 @@ impl App {
         }
     }
 
-    /// `P`: ask to post the open notes (the person's, and the findings marked to fix) as a
-    /// review on the pull request.
+    /// `P`: start a review of the pull request, with the open notes (the person's, and the
+    /// findings marked to fix) as its comments.
     fn ask_to_post(&mut self) {
         if self.pull_request.is_none() {
-            self.notice = Some("P posts notes to a pull request: open one with ribbon pr NUMBER".into());
+            self.notice = Some("P reviews a pull request: open one with ribbon pr NUMBER".into());
             return;
         }
         let notes: Vec<usize> = (0..self.notes.len()).filter(|&n| self.notes[n].is_open()).collect();
-        if notes.is_empty() {
-            self.notice = Some("no open notes to post (a adds one)".into());
+        self.review = Some(ReviewDraft { notes, verdict: None, summary: String::new() });
+    }
+
+    /// Keys while making a review: c/a/r pick the verdict, then the summary is typed.
+    fn apply_review_key(&mut self, key: &KeyEvent) {
+        use crate::github::Verdict;
+        if key.kind == KeyEventKind::Release {
             return;
         }
-        self.post_confirm = Some(notes);
+        let Some(review) = &mut self.review else { return };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let cancel = key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c'));
+        match review.verdict {
+            None => {
+                review.verdict = match key.code {
+                    KeyCode::Char('c') if !ctrl => Some(Verdict::Comment),
+                    KeyCode::Char('a') => Some(Verdict::Approve),
+                    KeyCode::Char('r') => Some(Verdict::RequestChanges),
+                    _ => None,
+                };
+                match review.verdict {
+                    // Plain keys while typing: the Kitty keyboard protocol can split composed characters.
+                    Some(_) => {
+                        let _ = io::stdout().write_all(KEYS_OFF.as_bytes());
+                    }
+                    None => {
+                        self.review = None;
+                        self.notice = Some("review canceled".into());
+                    }
+                }
+            }
+            Some(_) if cancel => {
+                self.review = None;
+                self.notice = Some("review canceled".into());
+                let _ = io::stdout().write_all(KEYS_ON.as_bytes());
+            }
+            Some(verdict) => match key.code {
+                KeyCode::Enter => {
+                    let review = self.review.take().expect("a review");
+                    let _ = io::stdout().write_all(KEYS_ON.as_bytes());
+                    self.post(&review.notes, verdict, &review.summary);
+                }
+                KeyCode::Backspace => {
+                    review.summary.pop();
+                }
+                KeyCode::Char(c) if !ctrl => review.summary.push(c),
+                _ => {}
+            },
+        }
     }
 
     /// Post notes as one review, then mark them "posted" so they are not posted again and
     /// are no longer tasks for Claude.
-    fn post(&mut self, notes: &[usize]) {
+    fn post(&mut self, notes: &[usize], verdict: crate::github::Verdict, summary: &str) {
         let Some(pr) = self.pull_request.clone() else { return };
         let chosen: Vec<&Note> = notes.iter().filter_map(|&n| self.notes.get(n)).collect();
         let result = crate::github::commentable(&pr).and_then(|lines| {
             let (comments, elsewhere) = crate::github::review(&chosen, &lines);
             let count = comments.len();
-            crate::github::post_review(&pr, comments, &elsewhere).map(|url| (url, count, elsewhere.len()))
+            crate::github::post_review(&pr, verdict, summary, comments, &elsewhere).map(|url| (url, count, elsewhere.len()))
         });
         match result {
             Ok((url, on_lines, in_text)) => {
                 let ids: Vec<String> = chosen.iter().filter_map(|n| n.id.clone()).collect();
-                let marked = ids.iter().try_for_each(|id| notes::set_status(&self.notes_file, id, "posted"));
-                self.load_notes();
-                self.rebuild(self.stream.wrap);
+                let marked = self.mark_posted(&ids);
                 let text = if in_text > 0 { format!(", {in_text} in the review text (lines not in the diff)") } else { String::new() };
+                let comments = if on_lines == 1 { "1 comment".to_owned() } else { format!("{on_lines} comments") };
                 self.notice = Some(match marked {
-                    Ok(()) => format!("posted {on_lines} comment{}{text}: {url}", if on_lines == 1 { "" } else { "s" }),
+                    Ok(()) => format!("posted the review ({}) with {comments}{text}: {url}", verdict.name()),
                     Err(error) => format!("posted ({url}), but could not mark the notes: {error:#}"),
                 });
             }
             Err(error) => self.notice = Some(format!("{error:#}")),
         }
+    }
+
+    /// Ctrl-P while typing a note: post that note as a comment at once, not in a review.
+    fn post_now(&mut self, note: usize) {
+        let Some(pr) = self.pull_request.clone() else { return };
+        let Some(found) = self.notes.get(note) else { return };
+        let result = crate::github::commentable(&pr).and_then(|lines| {
+            let (mut comments, _) = crate::github::review(&[found], &lines);
+            if comments.is_empty() {
+                anyhow::bail!("note saved; its lines are not in the pull request's diff, so it can only go in the review text (P)");
+            }
+            crate::github::post_comment(&pr, comments.remove(0))
+        });
+        match result {
+            Ok(url) => {
+                let ids: Vec<String> = found.id.iter().cloned().collect();
+                self.notice = Some(match self.mark_posted(&ids) {
+                    Ok(()) => format!("posted: {url}"),
+                    Err(error) => format!("posted ({url}), but could not mark the note: {error:#}"),
+                });
+            }
+            Err(error) => self.notice = Some(format!("{error:#}")),
+        }
+    }
+
+    fn mark_posted(&mut self, ids: &[String]) -> anyhow::Result<()> {
+        let marked = ids.iter().try_for_each(|id| notes::set_status(&self.notes_file, id, "posted"));
+        self.load_notes();
+        self.rebuild(self.stream.wrap);
+        marked
     }
 
     /// `F` and `D`: mark a finding to fix ("open") or dismiss it, then go to the next one.
@@ -1954,7 +2043,10 @@ impl App {
             KeyCode::Esc => {}
             KeyCode::Char('c') if ctrl => {}
             KeyCode::Enter if draft.text.trim().is_empty() => {}
-            KeyCode::Enter => {
+            KeyCode::Char('p') if ctrl && draft.text.trim().is_empty() => return,
+            KeyCode::Enter | KeyCode::Char('p') if key.code == KeyCode::Enter || (ctrl && self.pull_request.is_some()) => {
+                // Ctrl-P (or Ctrl-Enter or Alt-Enter, where the terminal sends them) posts at once.
+                let post_now = self.pull_request.is_some() && (key.code == KeyCode::Char('p') || key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
                 let note = Note {
                     id: Some(notes::new_id()),
                     path: draft.path.clone(),
@@ -1975,6 +2067,9 @@ impl App {
                         self.load_notes();
                         self.rebuild(self.stream.wrap);
                         self.picked_note = self.notes.iter().position(|n| n.id == note.id);
+                        if let Some(index) = self.picked_note.filter(|_| post_now) {
+                            self.post_now(index);
+                        }
                     }
                     Err(error) => {
                         self.notice = Some(format!("{error:#}"));
@@ -2258,14 +2353,8 @@ impl App {
             }
             return None;
         }
-        if let (Some(_), Event::Key(key)) = (&self.post_confirm, event) {
-            if key.kind != KeyEventKind::Release {
-                let notes = self.post_confirm.take().unwrap_or_default();
-                self.notice = Some("not posted".into());
-                if key.code == KeyCode::Char('y') {
-                    self.post(&notes);
-                }
-            }
+        if let (Some(_), Event::Key(key)) = (&self.review, event) {
+            self.apply_review_key(key);
             return None;
         }
         if let Event::Key(key) = event {
@@ -2888,6 +2977,68 @@ fn edit(path: &std::path::Path, line: usize, graphics: Graphics) -> io::Result<(
     status.map(|_| ())
 }
 
+/// A list to pick one line from, on its own screen before the viewer opens: typing filters
+/// it (words in any order), arrows or Ctrl-N/P move, Enter picks, Esc quits.
+pub fn pick(title: &str, lines: &[String]) -> anyhow::Result<Option<usize>> {
+    terminal::enable_raw_mode()?;
+    execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+    let result = pick_loop(title, lines);
+    let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+    let _ = terminal::disable_raw_mode();
+    result
+}
+
+fn pick_loop(title: &str, lines: &[String]) -> anyhow::Result<Option<usize>> {
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let (mut filter, mut selected) = (String::new(), 0usize);
+    loop {
+        let words: Vec<String> = filter.to_lowercase().split_whitespace().map(str::to_owned).collect();
+        let shown: Vec<usize> = (0..lines.len()).filter(|&i| words.iter().all(|w| lines[i].to_lowercase().contains(w.as_str()))).collect();
+        selected = selected.min(shown.len().saturating_sub(1));
+        term.draw(|frame| {
+            let area = frame.area();
+            let buf = frame.buffer_mut();
+            let heading = if filter.is_empty() {
+                format!(" {title}  (type to filter, ↑/↓ move, Enter open, Esc quit)")
+            } else {
+                format!(" {}/{} · filter: {filter}█", shown.len(), lines.len())
+            };
+            buf.set_line(0, 0, &Line::styled(heading, Style::default().add_modifier(Modifier::BOLD)), area.width);
+            let rows = area.height.saturating_sub(1) as usize;
+            let first = selected.saturating_sub(rows.saturating_sub(1));
+            for (row, (place, &index)) in shown.iter().enumerate().skip(first).take(rows).enumerate() {
+                let style = if place == selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+                let row_area = Rect::new(0, 1 + row as u16, area.width, 1);
+                clear(buf, row_area, style);
+                buf.set_line(1, row_area.y, &Line::styled(lines[index].clone(), style), area.width.saturating_sub(1));
+            }
+        })?;
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('c') if ctrl => return Ok(None),
+            KeyCode::Enter => return Ok(shown.get(selected).copied()),
+            KeyCode::Down => selected += 1,
+            KeyCode::Char('n' | 'j') if ctrl => selected += 1,
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Char('p' | 'k') if ctrl => selected = selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                filter.pop();
+                selected = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                filter.push(c);
+                selected = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn run(diffs: Vec<FileDiff>, settings: Settings) -> anyhow::Result<Outcome> {
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
@@ -2960,7 +3111,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         mark: None,
         pull_request: settings.pull_request.clone(),
         checks: None,
-        post_confirm: None,
+        review: None,
     };
     app.load_notes();
     // The view opens on the first change.

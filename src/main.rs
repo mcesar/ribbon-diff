@@ -47,7 +47,9 @@ USAGE:
     ribbon [OPTIONS] OLD NEW              two files, or two folders (git difftool --dir-diff)
     ribbon show [COMMIT] [-- PATHS]       one commit, like `git show` (default: HEAD)
     ribbon stash [STASH] [-- PATHS]       one stash, like `git stash show -p`
-    ribbon pr [NUMBER|URL] [-- PATHS]     a pull request, with `gh` (default: this branch's)
+    ribbon pr [NUMBER|URL|list] [-- PATHS]
+                                          a pull request, with `gh`: this branch's, or else
+                                          pick one of the open ones (`list` always picks)
     ribbon FILE.patch | ribbon -          a patch file, or a patch on stdin:
                                           git show | ribbon, or as git's pager:
                                           git config pager.diff ribbon
@@ -105,7 +107,8 @@ KEYS:
     y (no selection)    copy: p path, a absolute path, f file name, l path:line, c change
     Y                   copy the change as a patch (one side alone: its lines)
     a                   add a note for Claude on the selected or first changed line
-    P                   (ribbon pr) post the open notes as a review on the pull request
+    P                   (ribbon pr) review: comment, approve, or request changes, with the
+                        open notes as comments; Ctrl-P while typing a note posts it at once
     } / {               next/prev note          A        all notes      x  delete note
     F / D               on a review finding: fix it (Claude does) / dismiss it; then the next
 
@@ -668,6 +671,26 @@ fn spawn_watcher(options: Options, highlighter: Arc<Highlighter>, interval: Dura
     reloads
 }
 
+/// Pick an open pull request from a list. None when nothing is picked. `why` is the reason
+/// to show when there is nothing to pick.
+fn pick_pull_request(why: Option<anyhow::Error>) -> anyhow::Result<Option<github::PullRequest>> {
+    let open = github::list_open()?;
+    if open.is_empty() {
+        match why {
+            Some(error) => anyhow::bail!("{error:#}; and the repository has no open pull requests"),
+            None => anyhow::bail!("the repository has no open pull requests"),
+        }
+    }
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!("give a pull request number: ribbon pr NUMBER");
+    }
+    let lines: Vec<String> = open.iter().map(|(_, line)| line.clone()).collect();
+    let Some(index) = ui::pick(&format!("{} open pull requests", open.len()), &lines)? else {
+        return Ok(None);
+    };
+    Ok(Some(github::view(Some(&open[index].0.to_string()))?))
+}
+
 /// A path from the command line as the diff names it: relative to the top of the repository.
 fn repo_path(arg: &str, top: &Path) -> String {
     let given = Path::new(arg);
@@ -791,7 +814,18 @@ fn run() -> anyhow::Result<ExitCode> {
             Some(first) if first != "--" => (Some(first.as_str()), &rest[1..]),
             _ => (None, rest),
         };
-        let pr = github::view(which)?;
+        let pr = match which {
+            Some("list") => pick_pull_request(None)?,
+            Some(which) => Some(github::view(Some(which))?),
+            // No pull request for this branch: pick one of the open ones.
+            None => match github::view(None) {
+                Ok(pr) => Some(pr),
+                Err(error) => pick_pull_request(Some(error))?,
+            },
+        };
+        let Some(pr) = pr else {
+            return Ok(ExitCode::SUCCESS);
+        };
         github::fetch(&pr)?;
         let mut args = github::diff_args(&pr);
         args.extend(rest.iter().cloned());

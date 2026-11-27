@@ -198,17 +198,77 @@ pub fn review(notes: &[&Note], lines: &Commentable) -> (Vec<Value>, Vec<String>)
     (comments, elsewhere)
 }
 
-/// Post a review with comments on the head commit. Returns the review's URL.
-pub fn post_review(pr: &PullRequest, comments: Vec<Value>, elsewhere: &[String]) -> anyhow::Result<String> {
+/// The open pull requests, newest first: number, and a line to pick it by.
+pub fn list_open() -> anyhow::Result<Vec<(u64, String)>> {
+    let text = gh(&["pr", "list", "--state", "open", "--limit", "200", "--json", "number,title,author,headRefName,isDraft"])?;
+    let list: Vec<Value> = serde_json::from_str(&text).context("gh pr list did not send JSON")?;
+    Ok(list
+        .iter()
+        .filter_map(|pr| {
+            let number = pr["number"].as_u64()?;
+            let draft = if pr["isDraft"] == true { " (draft)" } else { "" };
+            let line = format!(
+                "#{number}  {}{draft}  ·  {}  ·  {}",
+                pr["title"].as_str().unwrap_or(""),
+                pr["author"]["login"].as_str().unwrap_or("?"),
+                pr["headRefName"].as_str().unwrap_or("")
+            );
+            Some((number, line))
+        })
+        .collect())
+}
+
+/// How a review ends: a comment, an approval, or a request for changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl Verdict {
+    fn event(self) -> &'static str {
+        match self {
+            Verdict::Comment => "COMMENT",
+            Verdict::Approve => "APPROVE",
+            Verdict::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Comment => "comment",
+            Verdict::Approve => "approve",
+            Verdict::RequestChanges => "request changes",
+        }
+    }
+}
+
+/// Post a review with comments on the head commit. The review's text is the summary, then the
+/// notes that have no line in the diff. Returns the review's URL.
+pub fn post_review(pr: &PullRequest, verdict: Verdict, summary: &str, comments: Vec<Value>, elsewhere: &[String]) -> anyhow::Result<String> {
+    let text: Vec<&str> = std::iter::once(summary.trim()).filter(|s| !s.is_empty()).chain(elsewhere.iter().map(String::as_str)).collect();
     let request = json!({
         "commit_id": pr.head,
-        "event": "COMMENT",
-        "body": elsewhere.join("\n\n"),
+        "event": verdict.event(),
+        "body": text.join("\n\n"),
         "comments": comments,
     });
-    let path = format!("repos/{}/pulls/{}/reviews", pr.repo, pr.number);
+    let reply = api_post(&format!("repos/{}/pulls/{}/reviews", pr.repo, pr.number), &request, "the review")?;
+    Ok(reply["html_url"].as_str().unwrap_or(&pr.url).to_owned())
+}
+
+/// Post one comment on its own, not in a review. Returns the comment's URL.
+pub fn post_comment(pr: &PullRequest, mut comment: Value) -> anyhow::Result<String> {
+    comment["commit_id"] = pr.head.clone().into();
+    let reply = api_post(&format!("repos/{}/pulls/{}/comments", pr.repo, pr.number), &comment, "the comment")?;
+    Ok(reply["html_url"].as_str().unwrap_or(&pr.url).to_owned())
+}
+
+/// POST a JSON request with `gh api`, and read the reply.
+fn api_post(path: &str, request: &Value, what: &str) -> anyhow::Result<Value> {
     let mut child = Command::new("gh")
-        .args(["api", "--method", "POST", &path, "--input", "-"])
+        .args(["api", "--method", "POST", path, "--input", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -220,9 +280,9 @@ pub fn post_review(pr: &PullRequest, comments: Vec<Value>, elsewhere: &[String])
     if !out.status.success() {
         let message = reply["message"].as_str().map(str::to_owned).unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_owned());
         let details = reply["errors"].as_array().map(|e| e.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default();
-        bail!("GitHub refused the review: {message} {details}");
+        bail!("GitHub refused {what}: {message} {details}");
     }
-    Ok(reply["html_url"].as_str().unwrap_or(&pr.url).to_owned())
+    Ok(reply)
 }
 
 #[cfg(test)]

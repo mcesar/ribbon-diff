@@ -49,9 +49,13 @@ As a pager, input that is not a diff is printed as it is.
 A pull request, with the [GitHub CLI](https://cli.github.com):
 
 ```sh
-ribbon pr 123                            # or a URL; no number: this branch's pull request
+ribbon pr 123                            # or a URL
+ribbon pr                                # this branch's pull request, or pick an open one
+ribbon pr list                           # pick one of the open pull requests
 ribbon pr 123 -- '*.ts'                  # only some files
 ```
+
+The list of open pull requests shows each one's title, author, and branch; type to filter it.
 
 ribbon fetches the pull request's commits when the clone does not have them (only
 `FETCH_HEAD` changes) and shows what the pull request page shows: the head against the point
@@ -59,10 +63,16 @@ where it left the base. The status line shows the checks, read again every 30 se
 `CI ✗ 1 failed (lint) · 12 passed`. `e` opens the editor only when the pull request is checked
 out with no local changes.
 
-`P` posts your open notes, and the findings marked to fix, as one review on the pull request,
-after you press `y` to confirm. Each note becomes a comment on its lines; a note on lines the
-pull request page does not show goes into the review text with its path and line. Posted notes
-show `posted` and are no longer tasks for Claude.
+To comment, click a line number (or select lines), press `a`, and type. Then:
+
+- `Ctrl-P` posts that comment at once, on its own.
+- `Enter` keeps it as a note for the review.
+
+`P` reviews the pull request: press `c` to comment, `a` to approve, or `r` to request changes,
+type a summary if you want one, and press `Enter` to post. The open notes, and the findings
+marked to fix, go with the review as comments on their lines; a note on lines the pull request
+page does not show goes into the review text with its path and line. Posted notes show `posted`
+and are no longer tasks for Claude.
 
 Outside git mode:
 
@@ -105,7 +115,8 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `}` / `{` | next / previous note |
 | `A` | list of all notes (`Enter` goes to one, `x` deletes it) |
 | `x` | delete the note picked with `}` / `{` |
-| `P` | in `ribbon pr`: post the open notes as a review on the pull request (asks first) |
+| `P` | in `ribbon pr`: review the pull request (comment, approve, or request changes) with the open notes as comments |
+| `Ctrl-P` | while typing a note in `ribbon pr`: post it as a comment at once |
 | `F` / `D` | on a code-review finding: fix it (Claude does) / dismiss it, then go to the next one; with no finding picked, go to the next one |
 | `q` | quit (in per-file mode, git opens the next file) |
 | `Q` | quit and stop git difftool's file loop |
