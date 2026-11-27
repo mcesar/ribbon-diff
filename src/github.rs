@@ -301,6 +301,7 @@ mod tests {
             author: Some("you".into()),
             status: Some("open".into()),
             reply: None,
+            kind: None,
             editable: true,
         }
     }

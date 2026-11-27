@@ -105,6 +105,11 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `v` | select whole lines with the keyboard: `j`/`k` extend, `o` goes to the other end, `J`/`K` move the whole selection one line; then `y` copy, `a` note, `Y` change, `e` edit, `Esc` cancel |
 | `m` | on moved code (purple), select where it went, or where it came from |
 | `r` | on a repeated edit, list every place it is made (`Enter` goes to one) |
+| `R` | mark the change reviewed (with every place of a repeated edit, or every change the selection covers), then go to the next change to review; `R` on a reviewed change takes the mark away |
+| `B` | who wrote the lines the change removes, newest first (`Enter` copies the commit id) |
+| `U` | select the next changed lines no test ran (needs a coverage file) |
+| `t` / `T` | next / previous stop of a guided tour |
+| `?` | ask the Claude session that wrote the code about the selected lines |
 | `:` | select lines by number: `:42`, `:40-52`, `:o42` for the old side, `:main.rs:42` for another file (any part of its path). Folds open, and the keys of `v` work on the selection |
 | click a line number | select that line; drag on the numbers or Shift-click another number for more lines. The keys of `v` work on it, so `a` adds a note on exactly those lines |
 | `e` | open `$VISUAL` or `$EDITOR` at the line: the start of the selection, or else the first changed line on screen; the view reloads after the editor closes |
@@ -151,6 +156,15 @@ one. Then ask Claude to handle the notes: it fixes the findings you marked and r
 
 The file uses [Hunk](https://github.com/modem-dev/hunk)'s agent-context format, so Hunk can read
 it too. `--agent-context FILE` shows such a file from another tool, read-only.
+
+## Reading a large change
+
+- **Reviewed changes:** `R` marks a change reviewed. The mark is kept in `.ribbon/reviewed.json` by a hash of the change's lines, so after a new push the changes that are the same keep their mark and only new or changed ones show as unreviewed. Reviewed changes show dimmer, and `n`/`N` skip them. The status line counts them.
+- **Removed code that is recent:** ribbon runs `git blame` on the removed lines in the background. A change that removes code someone else committed in the last 30 days (`--recent-days N`) gets a label with the commit, such as "Removes code added 9 days ago by Ana in 1a2b3c4d: fix the cascade lock". Your own recent code (git's `user.name`) gets none. `B` lists who wrote any change's removed lines.
+- **Lines no test ran:** with an lcov file (`--coverage FILE`, or `coverage/lcov.info` or `lcov.info` at the top), changed lines that no test ran have their numbers on orange. `U` goes to the next ones. The status line says when the coverage file is older than the changes.
+- **Ribbons:** a ribbon is faint when its change is reviewed or repeats an edit shown before, and has thick orange edges when the change adds lines no test ran or removes recent code of someone else.
+- **Guided tour:** Claude can write `.ribbon/tour.json`, the stops in the order to read the change, each with a sentence (the skill tells it how). `t` goes to the next stop and selects its lines; the stop's text shows under them.
+- **Questions:** select lines, press `?`, and ask. The question is a note for the Claude session that wrote the code: that session runs `ribbon wait` in the background, wakes when you ask, and answers under the lines.
 
 ## Claude controls the view
 

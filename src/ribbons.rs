@@ -20,8 +20,28 @@ pub struct RibbonColors {
 
 /// Fill or edge paint for one block: red for a deletion, green for an insertion, and a
 /// red-to-green fade for an edit, like the old side flowing into the new.
-fn ribbon_paint(kind: BlockKind, colors: &RibbonColors, width: f32, alpha: u8) -> Paint<'static> {
-    let color = |[r, g, b]: Rgb| Color::from_rgba8(r, g, b, alpha);
+/// How much a ribbon stands out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Emphasis {
+    #[default]
+    Normal,
+    /// Already reviewed, or a repeat of an edit seen before: faint.
+    Quiet,
+    /// Worth a closer look (lines no test ran, recent code of someone else removed): thick
+    /// orange edges.
+    Risky,
+}
+
+const RISKY: Rgb = [255, 165, 0];
+
+fn ribbon_paint(kind: BlockKind, colors: &RibbonColors, width: f32, alpha: u8, quiet: bool) -> Paint<'static> {
+    // Faint ribbons mix halfway into the background; with no known background, they only get
+    // more transparent.
+    let color = |[r, g, b]: Rgb| match (quiet, colors.background) {
+        (true, Some([br, bg, bb])) => Color::from_rgba8(((r as u16 + br as u16) / 2) as u8, ((g as u16 + bg as u16) / 2) as u8, ((b as u16 + bb as u16) / 2) as u8, alpha),
+        (true, None) => Color::from_rgba8(r, g, b, alpha / 2),
+        _ => Color::from_rgba8(r, g, b, alpha),
+    };
     let mut paint = Paint::default();
     paint.anti_alias = true;
     match kind {
@@ -51,7 +71,7 @@ pub struct View {
 
 /// Draw every ribbon that crosses the view. With a known background the image is opaque:
 /// terminals show transparent image pixels over their own default background, not ours.
-pub fn rasterize(blocks: &[Block], view: View, colors: &RibbonColors) -> Option<Pixmap> {
+pub fn rasterize(blocks: &[Block], emphasis: &[Emphasis], view: View, colors: &RibbonColors) -> Option<Pixmap> {
     let width = view.columns as f32 * view.cell_width as f32;
     let height = view.rows as f32 * view.cell_height as f32;
     let mut pixmap = Pixmap::new(width as u32, height as u32)?;
@@ -63,7 +83,9 @@ pub fn rasterize(blocks: &[Block], view: View, colors: &RibbonColors) -> Option<
     let row_y = |line: usize, top: usize| (line as f32 - top as f32) * cell;
     let edge_width = (cell / 16.0).max(1.0);
 
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
+        let emphasis = emphasis.get(index).copied().unwrap_or_default();
+        let quiet = emphasis == Emphasis::Quiet;
         let (l0, l1) = (row_y(block.a0, view.left_top), row_y(block.a1, view.left_top));
         let (r0, r1) = (row_y(block.b0, view.right_top), row_y(block.b1, view.right_top));
         if l1.max(r1) < -cell || l0.min(r0) > height + cell {
@@ -78,7 +100,7 @@ pub fn rasterize(blocks: &[Block], view: View, colors: &RibbonColors) -> Option<
         band.cubic_to(mid, r1, mid, l1, 0.0, l1);
         band.close();
         if let Some(path) = band.finish() {
-            let paint = ribbon_paint(block.kind(), colors, width, 95);
+            let paint = ribbon_paint(block.kind(), colors, width, 95, quiet);
             pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
         }
 
@@ -90,7 +112,15 @@ pub fn rasterize(blocks: &[Block], view: View, colors: &RibbonColors) -> Option<
         edges.move_to(0.0, l1 - inset);
         edges.cubic_to(mid, l1 - inset, mid, r1 - inset, width, r1 - inset);
         if let Some(path) = edges.finish() {
-            let paint = ribbon_paint(block.kind(), colors, width, 200);
+            let (paint, edge_width) = if emphasis == Emphasis::Risky {
+                let [r, g, b] = RISKY;
+                let mut paint = Paint::default();
+                paint.anti_alias = true;
+                paint.set_color(Color::from_rgba8(r, g, b, 255));
+                (paint, (edge_width * 3.0).max(2.0))
+            } else {
+                (ribbon_paint(block.kind(), colors, width, 200, quiet), edge_width)
+            };
             let stroke = Stroke { width: edge_width, ..Stroke::default() };
             pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
@@ -128,9 +158,9 @@ pub fn kitty_delete() -> String {
 
 /// Half-block fallback: one pixel column per cell, two pixel rows per cell.
 /// Returns (top, bottom) colors for each cell, row by row; None is the terminal background.
-pub fn half_blocks(blocks: &[Block], view: View, colors: &RibbonColors) -> Vec<Vec<(Option<Rgb>, Option<Rgb>)>> {
+pub fn half_blocks(blocks: &[Block], emphasis: &[Emphasis], view: View, colors: &RibbonColors) -> Vec<Vec<(Option<Rgb>, Option<Rgb>)>> {
     let small = View { cell_width: 1, cell_height: 2, ..view };
-    let Some(pixmap) = rasterize(blocks, small, colors) else {
+    let Some(pixmap) = rasterize(blocks, emphasis, small, colors) else {
         return Vec::new();
     };
     let pixel = |x: u32, y: u32| {
@@ -165,7 +195,7 @@ mod tests {
     #[test]
     fn draws_an_insert_ribbon_and_leaves_other_rows_empty() {
         let blocks = [Block { a0: 2, a1: 2, b0: 2, b1: 5 }];
-        let pixmap = rasterize(&blocks, view(8), &COLORS).unwrap();
+        let pixmap = rasterize(&blocks, &[], view(8), &COLORS).unwrap();
         let at = |x, y| pixmap.pixel(x, y).unwrap();
         assert_eq!(at(30, 10).green(), 0, "row 0 has no ribbon");
         assert!(at(55, 3 * 20 + 10).green() > 60, "right side of row 3 is inside the band");
@@ -185,8 +215,18 @@ mod tests {
             insert: [98, 186, 108],
             delete: [224, 98, 88],
         };
-        let pixmap = rasterize(&blocks, view(26), &colors).unwrap();
+        let pixmap = rasterize(&blocks, &[], view(26), &colors).unwrap();
         pixmap.save_png(std::env::var("RIBBON_DUMP").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn quiet_ribbons_are_fainter_and_risky_ones_have_orange_edges() {
+        let blocks = [Block { a0: 0, a1: 2, b0: 0, b1: 2 }];
+        let fill = |emphasis| rasterize(&blocks, &[emphasis], view(4), &COLORS).unwrap().pixel(30, 20).unwrap().demultiply();
+        let (normal, quiet) = (fill(Emphasis::Normal), fill(Emphasis::Quiet));
+        assert!(quiet.red() as u16 + quiet.green() as u16 > 0 && (quiet.red() as u16 + quiet.green() as u16) < normal.red() as u16 + normal.green() as u16);
+        let edge = rasterize(&blocks, &[Emphasis::Risky], view(4), &COLORS).unwrap().pixel(30, 1).unwrap().demultiply();
+        assert_eq!((edge.red(), edge.green() > 100, edge.blue() < 60), (255, true, true));
     }
 
     #[test]
@@ -195,7 +235,7 @@ mod tests {
         let big = View { left_top: 0, right_top: 0, columns: 6, rows: 60, cell_width: 18, cell_height: 38 };
         let blocks = [Block { a0: 2, a1: 3, b0: 2, b1: 40 }, Block { a0: 45, a1: 50, b0: 41, b1: 42 }];
         let colors = RibbonColors { background: Some([43, 48, 59]), insert: [0, 200, 0], delete: [200, 0, 0] };
-        let pixmap = rasterize(&blocks, big, &colors).unwrap();
+        let pixmap = rasterize(&blocks, &[], big, &colors).unwrap();
         let sequence = kitty_place(&pixmap, 40, 1, big);
         assert!(sequence.starts_with("\x1b[2;41H\x1b_Ga=T,f=100,i="));
         assert!(sequence.contains("c=6,r=60,C=1,q=2,m=1;"));

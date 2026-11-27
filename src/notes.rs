@@ -31,6 +31,8 @@ pub struct Note {
     pub author: Option<String>,
     pub status: Option<String>,
     pub reply: Option<String>,
+    /// "question" for a question to the session that wrote the code; None for a note.
+    pub kind: Option<String>,
     /// From the notes file, so it can be deleted. Notes from `--agent-context` can't.
     pub editable: bool,
 }
@@ -47,6 +49,10 @@ impl Note {
     /// fix it, or dismiss it.
     pub fn is_undecided(&self) -> bool {
         self.editable && self.is_finding() && self.status.as_deref().unwrap_or("new") == "new"
+    }
+
+    pub fn is_question(&self) -> bool {
+        self.kind.as_deref() == Some("question")
     }
 
     pub fn is_finding(&self) -> bool {
@@ -110,6 +116,7 @@ pub fn parse(text_of_file: &str, editable: bool) -> anyhow::Result<Vec<Note>> {
                 author: text(annotation, "author"),
                 status: text(annotation, "status"),
                 reply: text(annotation, "reply"),
+                kind: text(annotation, "kind"),
                 editable,
             });
         }
@@ -160,6 +167,7 @@ pub fn add(path: &Path, note: &Note) -> anyhow::Result<()> {
         "rationale": note.rationale,
         "author": note.author,
         "status": note.status,
+        "kind": note.kind,
     });
     if let Some(object) = annotation.as_object_mut() {
         object.retain(|_, value| !value.is_null());
@@ -270,7 +278,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// The rows a note takes on screen, `width` columns wide.
 pub fn rows(note: &Note, width: usize) -> Vec<(Part, String)> {
-    let mut title = note.author.clone().unwrap_or_else(|| "note".into());
+    let mut title = if note.is_question() { "question".to_owned() } else { note.author.clone().unwrap_or_else(|| "note".into()) };
     if let Some(state) = note.state() {
         title.push_str(&format!(" · {state}"));
     }
@@ -333,6 +341,7 @@ mod tests {
             author: Some("you".into()),
             status: Some("open".into()),
             reply: None,
+            kind: None,
             editable: true,
         };
         add(&path, &note).unwrap();

@@ -120,6 +120,14 @@ pub struct Settings {
     pub notice: Option<String>,
     /// Show moved blocks of code in their own color (`--no-moved` turns it off).
     pub moved: bool,
+    /// The commit the old side comes from, to blame removed lines. None outside git.
+    pub old_revision: Option<String>,
+    /// Removed code younger than this many days gets a label (0: never).
+    pub recent_days: u64,
+    /// An lcov file: added lines no test runs are marked.
+    pub coverage: Option<PathBuf>,
+    /// The top of the repository, which file names are relative to.
+    pub top: PathBuf,
     /// With `--listen`: commands from `ribbon send`.
     pub commands: Option<mpsc::Receiver<crate::listen::Request>>,
     /// `ribbon pr`: the pull request, and its checks in one line whenever they are read.
@@ -182,6 +190,18 @@ struct FileState {
     /// Lines of the repeats after the first, drawn dimmer: the edit was already read.
     old_seen: Vec<bool>,
     new_seen: Vec<bool>,
+    /// Each block's content hash, and whether it is marked reviewed.
+    block_hash: Vec<String>,
+    block_reviewed: Vec<bool>,
+    /// Lines of reviewed blocks, drawn dimmer.
+    old_reviewed: Vec<bool>,
+    new_reviewed: Vec<bool>,
+    /// Who wrote the removed lines, once `git blame` answers.
+    old_blame: Option<crate::history::Blame>,
+    /// Added (or changed) lines that no test ran, from the coverage file.
+    new_uncovered: Vec<bool>,
+    /// Blocks that remove recent code someone else wrote.
+    block_recent: Vec<bool>,
     old_tokens: Vec<Tokens>,
     new_tokens: Vec<Tokens>,
     added: usize,
@@ -209,6 +229,18 @@ impl FileState {
             old_moved: vec![None; diff.model.old.len()],
             new_moved: vec![None; diff.model.new.len()],
             block_repeat: vec![None; diff.model.blocks.len()],
+            block_hash: diff
+                .model
+                .blocks
+                .iter()
+                .map(|b| crate::reviewed::hunk_hash(&diff.new_name, &diff.model.old[b.a0..b.a1], &diff.model.new[b.b0..b.b1]))
+                .collect(),
+            block_reviewed: vec![false; diff.model.blocks.len()],
+            old_blame: None,
+            new_uncovered: vec![false; diff.model.new.len()],
+            block_recent: vec![false; diff.model.blocks.len()],
+            old_reviewed: vec![false; diff.model.old.len()],
+            new_reviewed: vec![false; diff.model.new.len()],
             old_seen: vec![false; diff.model.old.len()],
             new_seen: vec![false; diff.model.new.len()],
             diff,
@@ -798,7 +830,8 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 let changed = kinds[index].is_some();
                 let moved = (if old_side { &file.old_moved } else { &file.new_moved })[index].is_some();
                 // Moved lines take one tint, with no word marks: their words did not change.
-                let seen = (if old_side { &file.old_seen } else { &file.new_seen })[index];
+                let seen = (if old_side { &file.old_seen } else { &file.new_seen })[index]
+                    || (if old_side { &file.old_reviewed } else { &file.new_reviewed })[index];
                 let tints = match (changed, moved) {
                     (true, true) => theme.moved_tint().map(|tint| (tint, tint)),
                     (true, false) if seen => theme.seen_tints(old_side),
@@ -840,8 +873,16 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                             && (m.range.0 - 1..m.range.1).take(2000).any(|old| file.diff.model.new_line_outside_changes(old) == Some(index))
                     }
                 });
-                let number_style = if marked { number_style.bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD) } else { number_style };
-                if part == 0 || marked {
+                // Changed lines no test ran: their numbers on orange.
+                let uncovered = !old_side && file.new_uncovered.get(index) == Some(&true);
+                let number_style = if marked {
+                    number_style.bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else if uncovered {
+                    number_style.bg(Color::Indexed(214)).fg(Color::Black)
+                } else {
+                    number_style
+                };
+                if part == 0 || marked || uncovered {
                     let number = if part == 0 { number } else { " ".repeat(number_width as usize) };
                     buf.set_line(number_x, y, &Line::styled(number, number_style), number_width);
                 }
@@ -1026,7 +1067,7 @@ fn styled_tokens(tokens: &Tokens, changed: &[Range<usize>], row: Style, change: 
 }
 
 /// Kitty mode leaves blank cells under the image; block mode draws the ribbons itself.
-fn draw_ribbons(buf: &mut Buffer, area: Rect, blocks: &[Block], view: View, graphics: Graphics, theme: &Theme) {
+fn draw_ribbons(buf: &mut Buffer, area: Rect, blocks: &[Block], emphasis: &[ribbons::Emphasis], view: View, graphics: Graphics, theme: &Theme) {
     let base = theme.base();
     clear(buf, area, base);
     if graphics == Graphics::Kitty {
@@ -1034,7 +1075,7 @@ fn draw_ribbons(buf: &mut Buffer, area: Rect, blocks: &[Block], view: View, grap
     }
     let background = base.bg.unwrap_or(Color::Reset);
     let color = |c: Option<Rgb>| c.map_or(background, rgb);
-    let cells = ribbons::half_blocks(blocks, view, &theme.ribbons);
+    let cells = ribbons::half_blocks(blocks, emphasis, view, &theme.ribbons);
     for (row, line) in cells.iter().enumerate() {
         for (col, (top, bottom)) in line.iter().enumerate() {
             if top.is_none() && bottom.is_none() {
@@ -1145,6 +1186,16 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
             0 => String::new(),
             1 => "  ·  1 move (m)".to_owned(),
             n => format!("  ·  {n} moves (m)"),
+        } + &match app.files.iter().map(|f| f.block_reviewed.iter().filter(|&&r| r).count()).sum::<usize>() {
+            0 => String::new(),
+            done => format!("  ·  {done}/{} reviewed (R)", app.stream.blocks.len()),
+        } + &match app.files.iter().map(|f| f.new_uncovered.iter().filter(|&&u| u).count()).sum::<usize>() {
+            0 => String::new(),
+            n => format!("  ·  {n} lines not covered (U){}", if app.coverage_stale { ", coverage older than the changes" } else { "" }),
+        } + &match (&app.tour, app.tour_stop) {
+            (Some(tour), Some(stop)) => format!("  ·  tour {}/{} (t)", stop + 1, tour.stops.len()),
+            (Some(tour), None) if !tour.stops.is_empty() => format!("  ·  tour of {} stops (t)", tour.stops.len()),
+            _ => String::new(),
         } + &match app.repeats.len() {
             0 => String::new(),
             1 => "  ·  1 repeated edit (r)".to_owned(),
@@ -1156,6 +1207,35 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
 }
 
 /// A centered list of files; the selected one is highlighted.
+/// The commits that wrote a change's removed lines; the selected one is highlighted.
+fn draw_history_list(buf: &mut Buffer, area: Rect, app: &App, rows: &[(crate::history::Commit, String)], selected: usize) {
+    let width = area.width.saturating_sub(8).min(120).max(20);
+    let height = (rows.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let frame = match app.theme.rgb {
+        Some(_) => app.theme.panel(),
+        None => Style::default().bg(Color::Black).fg(Color::Reset),
+    };
+    clear(buf, Rect::new(x, y, width, height), frame);
+    let title = " who wrote the removed lines  (Enter copies the commit id, Esc close)";
+    buf.set_line(x, y, &Line::styled(title, frame.add_modifier(Modifier::BOLD)), width);
+    let now = crate::history::now();
+    let shown = (height - 2) as usize;
+    let first = selected.saturating_sub(shown.saturating_sub(1));
+    for (row, (index, (commit, lines))) in rows.iter().enumerate().skip(first).take(shown).enumerate() {
+        let style = if index == selected { frame.add_modifier(Modifier::REVERSED) } else { frame };
+        let row_area = Rect::new(x, y + 1 + row as u16, width, 1);
+        clear(buf, row_area, style);
+        let text = if commit.is_committed() {
+            format!(" {}  {:<14} {:<18} {}  ({lines})", commit.short_id(), crate::history::age(commit.time, now), commit.author, commit.summary)
+        } else {
+            format!(" not committed yet  ({lines})")
+        };
+        buf.set_line(x, row_area.y, &Line::styled(text, style), width);
+    }
+}
+
 /// The places of one repeated edit; the selected one is highlighted.
 fn draw_repeat_list(buf: &mut Buffer, area: Rect, app: &App, group: usize, selected: usize) {
     let found = &app.repeats[group];
@@ -1345,6 +1425,25 @@ struct App {
     label_start: usize,
     /// `r`: the places of one repeated edit, and the selected row.
     repeat_list: Option<(usize, usize)>,
+    /// Hashes of the changes marked reviewed, from `.ribbon/reviewed.json`.
+    reviewed: HashSet<String>,
+    reviewed_file: PathBuf,
+    old_revision: Option<String>,
+    recent_days: u64,
+    /// Blame results from the background, by the file's old name.
+    blames: Option<mpsc::Receiver<(String, crate::history::Blame)>>,
+    coverage_file: Option<PathBuf>,
+    top: PathBuf,
+    /// A guided tour from `.ribbon/tour.json`, and the stop on screen.
+    tour: Option<crate::tour::Tour>,
+    tour_file: PathBuf,
+    tour_stop: Option<usize>,
+    /// The coverage file is older than a changed file: its marks may be wrong.
+    coverage_stale: bool,
+    /// Why the coverage file could not be read.
+    coverage_error: Option<String>,
+    /// `B`: the commits that wrote the current change's removed lines, and the selected row.
+    history_list: Option<(Vec<(crate::history::Commit, String)>, usize)>,
     find_moves: bool,
     /// The list of notes, with its selected row.
     note_list: Option<usize>,
@@ -1384,6 +1483,8 @@ struct Draft {
     text: crate::textarea::TextArea,
     /// The screen row of the note's last line when typing started, to keep it in sight.
     line_y: Option<u16>,
+    /// A question to the session that wrote the code (`?`), not a note.
+    question: bool,
 }
 
 /// What follows `:`: an optional path and colon, an optional `o` for the old side, then a
@@ -1446,7 +1547,7 @@ fn draw_note_editor(buf: &mut Buffer, area: Rect, app: &App, draft: &Draft) {
     let post = if app.pull_request.is_some() { " · Ctrl-P post now" } else { "" };
     Block::bordered()
         .border_style(frame.fg(Color::Yellow))
-        .title(Line::styled(format!(" note on {}:{lines}{side} ", draft.path), frame.add_modifier(Modifier::BOLD)))
+        .title(Line::styled(format!(" {} on {}:{lines}{side} ", if draft.question { "question" } else { "note" }, draft.path), frame.add_modifier(Modifier::BOLD)))
         .title_bottom(Line::styled(format!(" Enter save · Shift-Enter new line{post} · Esc cancel "), frame.fg(app.theme.muted())))
         .render(editor, buf);
     let (cursor_row, cursor_column) = draft.text.cursor_place(columns);
@@ -1458,7 +1559,8 @@ fn draw_note_editor(buf: &mut Buffer, area: Rect, app: &App, draft: &Draft) {
         buf.set_line(x, y, &Line::styled(draft.text.row_text(row), frame), columns as u16);
     }
     if draft.text.is_blank() && cursor_row == 0 {
-        buf.set_line(x + 1, editor.y + 1, &Line::styled("What should change here?", frame.fg(app.theme.muted()).add_modifier(Modifier::ITALIC)), columns as u16 - 1);
+        let hint = if draft.question { "What do you want to know? The session that wrote this code answers." } else { "What should change here?" };
+        buf.set_line(x + 1, editor.y + 1, &Line::styled(hint, frame.fg(app.theme.muted()).add_modifier(Modifier::ITALIC)), columns as u16 - 1);
     }
     // The cursor: the cell under it reversed.
     let (cx, cy) = (x + cursor_column.min(columns) as u16, editor.y + 1 + (cursor_row - first) as u16);
@@ -1513,6 +1615,9 @@ impl App {
         }
         self.repeats = mark_repeats(&mut self.files);
         self.add_labels();
+        self.mark_reviewed();
+        self.spawn_blame();
+        self.mark_coverage();
         self.stream = self.build_stream(wrap);
         self.generation += 1;
         self.selection = None;
@@ -1841,7 +1946,7 @@ impl App {
 
     fn notes_stamp(&self) -> String {
         let agent = self.agent_file.as_deref().map(crate::git::stamp).unwrap_or_default();
-        format!("{}|{agent}", crate::git::stamp(&self.notes_file))
+        format!("{}|{agent}|{}", crate::git::stamp(&self.notes_file), crate::git::stamp(&self.tour_file))
     }
 
     /// Read both notes files. A file that can't be read keeps the notes on screen and says why.
@@ -1862,14 +1967,94 @@ impl App {
         }
         self.notes = loaded;
         self.label_start = self.notes.len();
+        self.load_tour();
         self.add_labels();
         self.picked_note = self.picked_note.filter(|&n| n < self.label_start);
+    }
+
+    /// Read the tour file. A new tour starts before its first stop.
+    fn load_tour(&mut self) {
+        match crate::tour::load(&self.tour_file) {
+            None => {
+                self.tour = None;
+                self.tour_stop = None;
+            }
+            Some(Ok(tour)) => {
+                if self.tour.as_ref() != Some(&tour) {
+                    if self.tour.is_some() || !tour.stops.is_empty() {
+                        self.notice = Some(format!("a tour with {} stops: t starts it", tour.stops.len()));
+                    }
+                    self.tour_stop = None;
+                    self.tour = Some(tour);
+                }
+            }
+            Some(Err(error)) => self.notice = Some(format!("{error:#}")),
+        }
+    }
+
+    /// `t` and `T`: the next or previous stop of the tour, its lines selected and its text
+    /// under them.
+    fn step_tour(&mut self, forward: bool) {
+        let Some(tour) = self.tour.clone() else {
+            self.notice = Some("no tour: ask Claude for one (it writes .ribbon/tour.json)".into());
+            return;
+        };
+        let count = tour.stops.len();
+        let next = match (self.tour_stop, forward) {
+            (None, true) => Some(0),
+            (None, false) => count.checked_sub(1),
+            (Some(i), true) => (i + 1 < count).then_some(i + 1),
+            (Some(i), false) => i.checked_sub(1),
+        };
+        let Some(index) = next else {
+            self.notice = Some(if forward { "the tour is over (T goes back)" } else { "this is the first stop" }.into());
+            return;
+        };
+        let stop = &tour.stops[index];
+        let found = self.file_named(&stop.path, stop.old_side).and_then(|file| {
+            let model = &self.files[file].diff.model;
+            let count = if stop.old_side { model.old.len() } else { model.new.len() };
+            let last = stop.range.1.min(count);
+            if stop.range.0 > last {
+                return Err(format!("stop {} is past the end of {}", index + 1, stop.path));
+            }
+            Ok((file, last))
+        });
+        self.tour_stop = Some(index);
+        self.add_labels();
+        self.rebuild(self.stream.wrap);
+        match found.and_then(|(file, last)| self.select_lines(file, stop.old_side, stop.range.0, last)) {
+            Ok(()) => {
+                let title = tour.title.as_deref().map(|t| format!("{t}: ")).unwrap_or_default();
+                self.notice = Some(format!("{title}stop {}/{count}  (t next, T back)", index + 1));
+            }
+            Err(problem) => self.notice = Some(format!("stop {}/{count}: {problem}", index + 1)),
+        }
     }
 
     /// A label under the first place of each repeated edit, kept after the real notes.
     fn add_labels(&mut self) {
         self.notes.truncate(self.label_start.min(self.notes.len()));
         self.label_start = self.notes.len();
+        // The tour's stop on screen.
+        if let Some((index, tour)) = self.tour_stop.zip(self.tour.as_ref()) {
+            if let Some(stop) = tour.stops.get(index) {
+                self.notes.push(Note {
+                    id: None,
+                    path: stop.path.clone(),
+                    old_side: stop.old_side,
+                    range: stop.range,
+                    anchor: None,
+                    summary: if stop.text.is_empty() { "(no text)".to_owned() } else { stop.text.clone() },
+                    rationale: None,
+                    author: Some(format!("tour {}/{}", index + 1, tour.stops.len())),
+                    status: None,
+                    reply: None,
+                    kind: None,
+                    editable: false,
+                });
+            }
+        }
         for group in &self.repeats {
             let Some(&(file, block)) = group.places.first() else { continue };
             let diff = &self.files[file].diff;
@@ -1887,8 +2072,241 @@ impl App {
                 author: Some(format!("same edit in {} places", group.places.len())),
                 status: None,
                 reply: None,
+                kind: None,
                 editable: false,
             });
+        }
+        // Removed code that someone else wrote recently. Removing your own recent code is
+        // normal work; removing another person's recent fix is worth a look.
+        let now = crate::history::now();
+        let me = std::process::Command::new("git").args(["config", "user.name"]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
+        let mut recent = Vec::new();
+        let mut recent_blocks = Vec::new();
+        for (file, state) in self.files.iter().enumerate() {
+            let Some(blame) = &state.old_blame else { continue };
+            for (block, b) in state.diff.model.blocks.iter().enumerate() {
+                let newest = (b.a0..b.a1)
+                    .filter(|&line| state.old_moved[line].is_none())
+                    .filter_map(|line| blame.commits.get(blame.lines.get(&line)?))
+                    .filter(|c| c.is_committed() && me.as_deref() != Some(c.author.as_str()))
+                    .max_by_key(|c| c.time);
+                if let Some(commit) = newest.filter(|c| self.recent_days > 0 && now.saturating_sub(c.time) < self.recent_days * 86_400) {
+                    recent_blocks.push((file, block));
+                    // Under the change's new lines when it has some, so both sides stay level.
+                    let (old_side, path, line) = if b.b1 > b.b0 { (false, &state.diff.new_name, b.b1) } else { (true, &state.diff.old_name, b.a1) };
+                    recent.push(Note {
+                        id: None,
+                        path: path.clone(),
+                        old_side,
+                        range: (line, line),
+                        anchor: None,
+                        summary: format!(
+                            "Removes code added {} by {} in {}: {}. B shows who wrote these lines.",
+                            crate::history::age(commit.time, now),
+                            commit.author,
+                            commit.short_id(),
+                            commit.summary
+                        ),
+                        rationale: None,
+                        author: Some("recent code removed".into()),
+                        status: None,
+                        reply: None,
+                        kind: None,
+                        editable: false,
+                    });
+                }
+            }
+        }
+        self.notes.extend(recent);
+        for state in &mut self.files {
+            state.block_recent.iter_mut().for_each(|r| *r = false);
+        }
+        for (file, block) in recent_blocks {
+            self.files[file].block_recent[block] = true;
+        }
+    }
+
+    /// How much each change's ribbon stands out: faint when reviewed or a repeat already
+    /// seen, orange edges when it adds lines no test ran or removes recent code of someone else.
+    fn ribbon_emphasis(&self) -> Vec<ribbons::Emphasis> {
+        self.files
+            .iter()
+            .flat_map(|state| {
+                state.diff.model.blocks.iter().enumerate().map(move |(index, b)| {
+                    if state.block_recent[index] || state.new_uncovered[b.b0..b.b1].iter().any(|&u| u) {
+                        ribbons::Emphasis::Risky
+                    } else if state.block_reviewed[index] || state.block_repeat[index].is_some_and(|(_, place)| place > 0) {
+                        ribbons::Emphasis::Quiet
+                    } else {
+                        ribbons::Emphasis::Normal
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Read the coverage file and mark the changed lines no test ran.
+    fn mark_coverage(&mut self) {
+        let Some(path) = self.coverage_file.clone() else { return };
+        let coverage = match crate::coverage::load(&path) {
+            Ok(coverage) => coverage,
+            Err(error) => {
+                self.coverage_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        self.coverage_error = None;
+        self.coverage_stale = false;
+        for state in &mut self.files {
+            state.new_uncovered.iter_mut().for_each(|u| *u = false);
+            let Some(lines) = coverage.for_path(&state.diff.new_name, &self.top) else { continue };
+            for (index, kind) in state.new_kinds.iter().enumerate() {
+                // Lines with no entry are not code (blank, comments, declarations).
+                if kind.is_some() && lines.get(&(index + 1)) == Some(&0) {
+                    state.new_uncovered[index] = true;
+                }
+            }
+            let changed = state.diff.path.as_deref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+            if let (Some(changed), Some(written)) = (changed, coverage.written) {
+                self.coverage_stale |= changed > written;
+            }
+        }
+    }
+
+    /// `U`: select the next added line no test ran, after the current one.
+    fn next_uncovered(&mut self) {
+        let mut places: Vec<(usize, usize)> = Vec::new();
+        for (file, state) in self.files.iter().enumerate() {
+            places.extend(state.new_uncovered.iter().enumerate().filter(|(_, u)| **u).map(|(line, _)| (file, line)));
+        }
+        if places.is_empty() {
+            self.notice = Some(match (&self.coverage_file, &self.coverage_error) {
+                (None, _) => "no coverage file: give one with --coverage lcov.info".to_owned(),
+                (_, Some(error)) => error.clone(),
+                _ => "every changed line ran in the tests".to_owned(),
+            });
+            return;
+        }
+        let here = self.selection.and_then(|s| self.line_of(s.old_side, s.bounds().0 .0)).map(|(_, file, line, _)| (file, line));
+        let next = here.and_then(|h| places.iter().copied().find(|&p| p > h)).unwrap_or(places[0]);
+        // A run of uncovered lines is selected together.
+        let (file, first) = next;
+        let mut last = first;
+        while self.files[file].new_uncovered.get(last + 1) == Some(&true) {
+            last += 1;
+        }
+        let count = places.len();
+        match self.select_lines(file, false, first + 1, last + 1) {
+            Ok(()) => {
+                let stale = if self.coverage_stale { "  (the coverage file is older than the changes)" } else { "" };
+                self.notice = Some(format!("no test ran these lines  ·  {count} changed lines not covered{stale}"));
+            }
+            Err(problem) => self.notice = Some(problem),
+        }
+    }
+
+    /// Blame the removed lines of every file on a background thread; labels appear as the
+    /// answers come.
+    fn spawn_blame(&mut self) {
+        let Some(revision) = self.old_revision.clone() else { return };
+        let jobs: Vec<(String, String, Vec<std::ops::Range<usize>>)> = self
+            .files
+            .iter()
+            .filter_map(|state| {
+                let removed = |line: usize| state.old_kinds[line].is_some() && state.old_moved[line].is_none();
+                let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+                for line in (0..state.diff.model.old.len()).filter(|&l| removed(l)) {
+                    match ranges.last_mut() {
+                        Some(last) if last.end == line => last.end = line + 1,
+                        _ => ranges.push(line..line + 1),
+                    }
+                }
+                (!ranges.is_empty()).then(|| {
+                    let text: String = state.diff.model.old.iter().map(|l| format!("{l}\n")).collect();
+                    (state.diff.old_name.clone(), text, ranges)
+                })
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let (sender, blames) = mpsc::channel();
+        thread::spawn(move || {
+            for (name, text, ranges) in jobs {
+                if let Some(blame) = crate::history::blame(&name, &text, &revision, &ranges) {
+                    if sender.send((name, blame)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        self.blames = Some(blames);
+    }
+
+    /// A blame answer from the background.
+    fn take_blame(&mut self, name: String, blame: crate::history::Blame) {
+        if let Some(state) = self.files.iter_mut().find(|f| f.diff.old_name == name) {
+            state.old_blame = Some(blame);
+            self.add_labels();
+            self.rebuild(self.stream.wrap);
+        }
+    }
+
+    /// `B`: list the commits that wrote the current change's removed lines, newest first.
+    fn open_history(&mut self) {
+        let Some((file, block)) = self.current_change().checked_sub(1).and_then(|i| self.change_at(i)) else {
+            self.notice = Some("no change here".into());
+            return;
+        };
+        let state = &self.files[file];
+        let b = state.diff.model.blocks[block];
+        if b.a0 == b.a1 {
+            self.notice = Some("this change removes no lines".into());
+            return;
+        }
+        let Some(blame) = &state.old_blame else {
+            self.notice = Some(if self.old_revision.is_none() { "no history: this diff does not come from git" } else { "still reading the history; try again in a moment" }.into());
+            return;
+        };
+        let mut found: Vec<(crate::history::Commit, Vec<usize>)> = Vec::new();
+        for line in b.a0..b.a1 {
+            let Some(commit) = blame.lines.get(&line).and_then(|id| blame.commits.get(id)) else { continue };
+            match found.iter_mut().find(|(c, _)| c.id == commit.id) {
+                Some((_, lines)) => lines.push(line + 1),
+                None => found.push((commit.clone(), vec![line + 1])),
+            }
+        }
+        found.sort_by_key(|(c, _)| std::cmp::Reverse(c.time));
+        let rows = found
+            .into_iter()
+            .map(|(commit, lines)| {
+                let (first, last) = (lines[0], lines[lines.len() - 1]);
+                let lines = if first == last { format!("line {first}") } else { format!("{} lines, {first}–{last}", lines.len()) };
+                (commit, lines)
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            self.notice = Some("no history for these lines".into());
+        } else {
+            self.history_list = Some((rows, 0));
+        }
+    }
+
+    fn apply_history_list(&mut self, key: &KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let Some((rows, selected)) = &mut self.history_list else { return };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('B') | KeyCode::Char('q') => self.history_list = None,
+            KeyCode::Char('j') | KeyCode::Down => *selected = (*selected + 1).min(rows.len() - 1),
+            KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => {
+                let id = rows[*selected].0.id.clone();
+                self.history_list = None;
+                self.copy_text(&id, "commit id");
+            }
+            _ => {}
         }
     }
 
@@ -1908,9 +2326,104 @@ impl App {
         None
     }
 
-    /// True for a change that repeats an edit seen earlier: n and N skip it.
+    /// True for a change n and N skip: a repeat of an edit seen earlier, or one marked reviewed.
     fn is_seen_repeat(&self, index: usize) -> bool {
-        self.change_at(index).and_then(|(file, block)| self.files[file].block_repeat[block]).is_some_and(|(_, place)| place > 0)
+        self.change_at(index).is_some_and(|(file, block)| {
+            let state = &self.files[file];
+            state.block_reviewed[block] || state.block_repeat[block].is_some_and(|(_, place)| place > 0)
+        })
+    }
+
+    /// Set each block's reviewed flag, and its lines', from the hashes marked reviewed.
+    fn mark_reviewed(&mut self) {
+        for state in &mut self.files {
+            state.old_reviewed.iter_mut().chain(state.new_reviewed.iter_mut()).for_each(|r| *r = false);
+            for (index, hash) in state.block_hash.iter().enumerate() {
+                let reviewed = self.reviewed.contains(hash);
+                state.block_reviewed[index] = reviewed;
+                if reviewed {
+                    let b = state.diff.model.blocks[index];
+                    state.old_reviewed[b.a0..b.a1].iter_mut().chain(state.new_reviewed[b.b0..b.b1].iter_mut()).for_each(|r| *r = true);
+                }
+            }
+        }
+    }
+
+    /// The blocks a selection covers, as (file, block).
+    fn blocks_in_selection(&self) -> Vec<(usize, usize)> {
+        let Some(selection) = self.selection else { return Vec::new() };
+        let (start, end) = selection.bounds();
+        let mut found = Vec::new();
+        for row in start.0..=end.0 {
+            let Some((is_old, file, line, _)) = self.line_of(selection.old_side, row) else { continue };
+            let blocks = &self.files[file].diff.model.blocks;
+            let block = blocks.iter().position(|b| if is_old { b.a0 <= line && line < b.a1 } else { b.b0 <= line && line < b.b1 });
+            if let Some(block) = block.filter(|&b| !found.contains(&(file, b))) {
+                found.push((file, block));
+            }
+        }
+        found
+    }
+
+    /// `R`: mark the current change reviewed (or the changes the selection covers), with
+    /// every other place of a repeated edit, then go to the next change to review. On
+    /// reviewed changes it takes the mark away.
+    fn toggle_reviewed(&mut self) {
+        let mut targets = self.blocks_in_selection();
+        if targets.is_empty() {
+            match self.current_change().checked_sub(1).and_then(|i| self.change_at(i)) {
+                Some(here) => targets.push(here),
+                None => {
+                    self.notice = Some("no change here to mark".into());
+                    return;
+                }
+            }
+        }
+        // Reviewing an edit once reviews all its places.
+        for &(file, block) in targets.clone().iter() {
+            if let Some((group, _)) = self.files[file].block_repeat[block] {
+                targets.extend(self.repeats[group].places.iter().copied().filter(|p| *p != (file, block)));
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        let mark = !targets.iter().all(|&(file, block)| self.files[file].block_reviewed[block]);
+        let changes: Vec<(String, String)> =
+            targets.iter().map(|&(file, block)| (self.files[file].block_hash[block].clone(), self.files[file].diff.new_name.clone())).collect();
+        if let Err(error) = crate::reviewed::set(&self.reviewed_file, &changes, mark) {
+            self.notice = Some(format!("{error:#}"));
+            return;
+        }
+        for (hash, _) in &changes {
+            if mark {
+                self.reviewed.insert(hash.clone());
+            } else {
+                self.reviewed.remove(hash);
+            }
+        }
+        self.mark_reviewed();
+        self.generation += 1;
+        self.selection = None;
+        self.visual = false;
+        let total = self.stream.blocks.len();
+        let done = self.files.iter().map(|f| f.block_reviewed.iter().filter(|&&r| r).count()).sum::<usize>();
+        if !mark {
+            self.notice = Some(format!("not reviewed any more  ·  {done}/{total} reviewed"));
+            return;
+        }
+        // On to the next change that is not reviewed (and not a repeat already seen).
+        let here = targets.iter().map(|&(file, block)| self.change_index(file, block)).min().unwrap_or(0);
+        let starts = self.stream.change_starts(self.scroll_off);
+        let next = (here + 1..starts.len()).chain(0..here).find(|&i| !self.is_seen_repeat(i));
+        let places = if changes.len() > 1 { format!("{} changes", changes.len()) } else { "change".to_owned() };
+        match next {
+            Some(index) => {
+                self.position = starts[index];
+                self.picked_change = Some(index);
+                self.notice = Some(format!("{places} reviewed  ·  {done}/{total} reviewed  (R on a reviewed change takes the mark away)"));
+            }
+            None => self.notice = Some(format!("{places} reviewed  ·  all {total} changes reviewed")),
+        }
     }
 
     /// `r`: list the places of the repeated edit at the current change.
@@ -2296,7 +2809,7 @@ impl App {
                     Err(_) => (path, None, false),
                 };
                 let id = notes::new_id();
-                let note = Note { id: Some(id.clone()), path, old_side, range, anchor, summary, rationale, author: Some(author), status, reply: None, editable: true };
+                let note = Note { id: Some(id.clone()), path, old_side, range, anchor, summary, rationale, author: Some(author), status, reply: None, kind: None, editable: true };
                 if let Err(problem) = notes::add(&self.notes_file, &note) {
                     return error(format!("{problem:#}"));
                 }
@@ -2446,6 +2959,11 @@ impl App {
 
     /// `a`: start a note on the selected lines, or on the line `e` would open.
     fn start_note(&mut self) {
+        self.start_draft(false);
+    }
+
+    /// `a` writes a note; `?` asks a question.
+    fn start_draft(&mut self, question: bool) {
         let place = match self.selection {
             Some(selection) => {
                 let (start, end) = selection.bounds();
@@ -2477,7 +2995,7 @@ impl App {
             let area = if pane { self.sides.0 } else { self.sides.1 };
             (row >= top && row < top + self.body_rows).then(|| area.y + (row - top) as u16)
         });
-        self.note_draft = Some(Draft { path, old_side, range: (first + 1, last + 1), anchor, text: Default::default(), line_y });
+        self.note_draft = Some(Draft { path, old_side, range: (first + 1, last + 1), anchor, text: Default::default(), line_y, question });
         let _ = io::stdout().write_all(KEYS_TYPING.as_bytes());
     }
 
@@ -2540,6 +3058,7 @@ impl App {
             author: Some("you".into()),
             status: Some("open".into()),
             reply: None,
+            kind: draft.question.then(|| "question".to_owned()),
             editable: true,
         };
         if let Err(error) = notes::add(&self.notes_file, &note) {
@@ -2549,7 +3068,11 @@ impl App {
             return;
         }
         self.close_draft();
-        self.notice = Some(format!("note saved in {}", self.notes_file.display()));
+        self.notice = Some(if draft.question {
+            "question saved: a Claude session that runs `ribbon wait` answers it under the lines".to_owned()
+        } else {
+            format!("note saved in {}", self.notes_file.display())
+        });
         self.selection = None;
         self.load_notes();
         self.rebuild(self.stream.wrap);
@@ -2834,6 +3357,10 @@ impl App {
                 return None;
             }
         }
+        if let (Some(_), Event::Key(key)) = (&self.history_list, event) {
+            self.apply_history_list(key);
+            return None;
+        }
         if let (Some((group, selected)), Event::Key(key)) = (self.repeat_list, event) {
             self.apply_repeat_list(key, group, selected);
             return None;
@@ -2951,6 +3478,31 @@ impl App {
                         self.open_repeat_list();
                         self.position
                     }
+                    KeyCode::Char('?') => {
+                        self.start_draft(true);
+                        self.visual = false;
+                        self.position
+                    }
+                    KeyCode::Char('t') => {
+                        self.step_tour(true);
+                        self.position
+                    }
+                    KeyCode::Char('T') => {
+                        self.step_tour(false);
+                        self.position
+                    }
+                    KeyCode::Char('U') => {
+                        self.next_uncovered();
+                        self.position
+                    }
+                    KeyCode::Char('B') => {
+                        self.open_history();
+                        self.position
+                    }
+                    KeyCode::Char('R') => {
+                        self.toggle_reviewed();
+                        self.position
+                    }
                     KeyCode::Char('m') => {
                         self.jump_to_other_end();
                         self.position
@@ -3064,7 +3616,7 @@ impl App {
                             index = if forward { Some(i + 1).filter(|&i| i < starts.len()) } else { i.checked_sub(1) };
                         }
                         if skipped > 0 {
-                            self.notice = Some(format!("skipped {skipped} repeat{} of an edit already shown (r lists them)", if skipped == 1 { "" } else { "s" }));
+                            self.notice = Some(format!("skipped {skipped} change{} already reviewed or repeating an edit shown before", if skipped == 1 { "" } else { "s" }));
                         }
                         match index {
                             Some(index) => {
@@ -3621,6 +4173,19 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         repeats,
         label_start: 0,
         repeat_list: None,
+        reviewed: crate::reviewed::load(&crate::reviewed::reviewed_file(&settings.notes_file)),
+        reviewed_file: crate::reviewed::reviewed_file(&settings.notes_file),
+        old_revision: settings.old_revision.clone(),
+        recent_days: settings.recent_days,
+        blames: None,
+        history_list: None,
+        coverage_file: settings.coverage.clone(),
+        top: settings.top.clone(),
+        tour: None,
+        tour_file: crate::tour::tour_file(&settings.notes_file),
+        tour_stop: None,
+        coverage_stale: false,
+        coverage_error: None,
         find_moves: settings.moved,
         note_list: None,
         mark: None,
@@ -3629,6 +4194,12 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         review: None,
     };
     app.load_notes();
+    app.mark_reviewed();
+    app.spawn_blame();
+    app.mark_coverage();
+    if let Some(error) = app.coverage_error.clone() {
+        app.notice = Some(error);
+    }
     // The view opens on the first change.
     app.picked_change = (!app.stream.blocks.is_empty()).then_some(0);
     let mut last_image: Option<(bool, usize, View)> = None;
@@ -3674,6 +4245,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         app.sides = (parts.left, parts.right);
         app.body_rows = body_rows;
 
+        let emphasis = app.ribbon_emphasis();
         term.draw(|frame| {
             let buf = frame.buffer_mut();
             draw_side(buf, parts.left, left_top, &app, true);
@@ -3685,13 +4257,16 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
                     draw_file_title(buf, Rect { height: 1, ..area }, &app, sticky, old_side, selected);
                 }
             }
-            draw_ribbons(buf, parts.ribbons, &app.stream.blocks, view, graphics, &app.theme);
+            draw_ribbons(buf, parts.ribbons, &app.stream.blocks, &emphasis, view, graphics, &app.theme);
             draw_status(buf, parts.status, &app, file);
             if let Some(selected) = app.note_list {
                 draw_note_list(buf, area, &app, selected);
             }
             if let Some((group, selected)) = app.repeat_list {
                 draw_repeat_list(buf, area, &app, group, selected);
+            }
+            if let Some((rows, selected)) = &app.history_list {
+                draw_history_list(buf, area, &app, rows, *selected);
             }
             if let Some(selected) = app.picker {
                 draw_picker(buf, area, &app, selected);
@@ -3703,12 +4278,12 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
 
         if graphics == Graphics::Kitty {
             // The lists cover the ribbon column, so the image comes down while one is open.
-            let wanted = (app.picker.is_none() && app.note_list.is_none() && app.note_draft.is_none() && app.repeat_list.is_none()).then_some((app.whole_file, app.generation, view));
+            let wanted = (app.picker.is_none() && app.note_list.is_none() && app.note_draft.is_none() && app.repeat_list.is_none() && app.history_list.is_none()).then_some((app.whole_file, app.generation, view));
             if wanted != last_image {
                 let backend = term.backend_mut();
                 match wanted {
                     Some(_) if view.columns > 0 && view.rows > 0 => {
-                        if let Some(pixmap) = ribbons::rasterize(&app.stream.blocks, view, &app.theme.ribbons) {
+                        if let Some(pixmap) = ribbons::rasterize(&app.stream.blocks, &emphasis, view, &app.theme.ribbons) {
                             backend.write_all(ribbons::kitty_place(&pixmap, parts.ribbons.x, parts.ribbons.y, view).as_bytes())?;
                         }
                     }
@@ -3740,6 +4315,9 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
                 if app.reload(diffs) {
                     highlights = spawn_highlighting(&app.files, &settings.highlighter);
                 }
+                break;
+            } else if let Some((name, blame)) = app.blames.as_ref().and_then(|b| b.try_recv().ok()) {
+                app.take_blame(name, blame);
                 break;
             } else if let Some(line) = settings.checks.as_ref().and_then(|c| c.try_recv().ok()) {
                 app.checks = Some(line);

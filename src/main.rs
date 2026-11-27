@@ -10,7 +10,9 @@
 
 mod config;
 mod context;
+mod coverage;
 mod git;
+mod history;
 mod github;
 mod ribbons;
 mod highlight;
@@ -19,12 +21,14 @@ mod listen;
 mod model;
 mod moves;
 mod repeats;
+mod reviewed;
 mod notes;
 mod patch;
 mod search;
 mod select;
 mod termcolors;
 mod textarea;
+mod tour;
 mod ui;
 
 use anyhow::Context;
@@ -59,6 +63,8 @@ USAGE:
     ribbon PATH OLD-FILE OLD-HEX OLD-MODE NEW-FILE NEW-HEX NEW-MODE [NEW-PATH INFO]
                                           (as GIT_EXTERNAL_DIFF)
     ribbon send COMMAND ...               control a ribbon started with --listen (below)
+    ribbon wait [--notes] [--timeout S]   wait for a question asked with ? (for Claude, in the
+                                          background), print it, and exit
 
     Git mode passes everything it does not know to `git diff`: commits and ranges,
     --cached, and pathspecs after --. For example:
@@ -83,6 +89,9 @@ OPTIONS:
                                 auto (the default) is unified in terminals under 120 columns
     --wrap                      wrap long lines (the w key switches it)
     --no-moved                  do not show moved code in its own color
+    --recent-days N             label removed code younger than N days (default: 30; 0: never)
+    --coverage FILE             an lcov file: mark added lines no test runs (default:
+                                coverage/lcov.info or lcov.info at the top, when there)
     --scroll-off N              rows kept above a change, match, or note the view jumps to,
                                 and around the keyboard selection (default: 3)
     -U, --context N             unchanged lines shown around each change (default: 3)
@@ -117,6 +126,11 @@ KEYS:
                         Enter saves, Shift-Enter (or Alt-Enter, Ctrl-J) starts a new line
     P                   (ribbon pr) review: comment, approve, or request changes, with the
                         open notes as comments; Ctrl-P while typing a note posts it at once
+    ?                   ask the Claude session that wrote the code about the selected lines
+    t / T               next / previous stop of a guided tour (.ribbon/tour.json)
+    R                   mark the change reviewed (all places of a repeated edit); n skips it
+    B                   who wrote the lines the change removes
+    U                   next changed lines no test ran (with a coverage file)
     } / {               next/prev note          A        all notes      x  delete note
     F / D               on a review finding: fix it (Claude does) / dismiss it; then the next
 
@@ -169,6 +183,10 @@ struct Options {
     listen: Option<PathBuf>,
     /// Show moved code in its own color.
     moved: bool,
+    /// Removed code younger than this many days gets a label.
+    recent_days: u64,
+    /// An lcov file, to mark added lines that no test runs.
+    coverage: Option<PathBuf>,
     /// `ribbon pr`: the pull request shown.
     pull_request: Option<github::PullRequest>,
 }
@@ -211,6 +229,8 @@ fn apply_config(options: &mut Options, table: &toml::Table) -> anyhow::Result<()
             "untracked" => options.untracked = flag(value)?,
             "wrap" => options.wrap = flag(value)?,
             "moved" => options.moved = flag(value)?,
+            "recent-days" => options.recent_days = number(value)? as u64,
+            "coverage" => options.coverage = Some(text(value)?.into()),
             "listen" => {
                 options.listen = match value {
                     Value::Boolean(on) => on.then(PathBuf::new),
@@ -257,6 +277,8 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
         listen: None,
         pull_request: None,
         moved: true,
+        recent_days: 30,
+        coverage: None,
     };
     let config = config::load()?;
     apply_config(&mut options, &config).with_context(|| format!("in {}", config::path().unwrap_or_default().display()))?;
@@ -297,6 +319,10 @@ fn parse_args() -> anyhow::Result<Option<Options>> {
             }
             "--wrap" => options.wrap = true,
             "--no-moved" => options.moved = false,
+            "--coverage" => options.coverage = Some(args.next().context("--coverage needs an lcov file")?.into()),
+            "--recent-days" => {
+                options.recent_days = args.next().context("--recent-days needs a number")?.parse().context("--recent-days needs a number")?
+            }
             "--listen" => options.listen = Some(PathBuf::new()),
             _ if arg.starts_with("--listen=") => options.listen = Some(arg["--listen=".len()..].into()),
             _ => options.positional.push(arg),
@@ -704,6 +730,31 @@ fn pick_pull_request(why: Option<anyhow::Error>) -> anyhow::Result<Option<github
     Ok(Some(github::view(Some(&open[index].0.to_string()))?))
 }
 
+/// The commit the old side comes from, for `git blame`: the first commit of the arguments,
+/// the start of a range, or the merge base for `A...B`; HEAD for changes not committed.
+/// None when the diff does not come from git.
+fn old_revision(options: &Options) -> Option<String> {
+    if !matches!(source(options), Source::Git) {
+        return None;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    let or_head = |name: &str| if name.is_empty() { "HEAD".to_owned() } else { name.to_owned() };
+    for arg in options.positional.iter().take_while(|a| *a != "--").filter(|a| !a.starts_with('-')) {
+        if let Some((a, b)) = arg.split_once("...") {
+            return git(&["merge-base", &or_head(a), &or_head(b)]);
+        }
+        if let Some((a, _)) = arg.split_once("..") {
+            return Some(or_head(a));
+        }
+        if git(&["rev-parse", "--verify", "--quiet", &format!("{arg}^{{commit}}")]).is_some() {
+            return Some(arg.clone());
+        }
+    }
+    Some("HEAD".to_owned())
+}
+
 /// A path from the command line as the diff names it: relative to the top of the repository.
 fn repo_path(arg: &str, top: &Path) -> String {
     let given = Path::new(arg);
@@ -731,6 +782,44 @@ fn path_and_lines(arg: &str) -> anyhow::Result<(&str, Option<(usize, usize)>)> {
         anyhow::bail!("{arg:?}: the first line comes after the last");
     }
     Ok((path, Some((first, last))))
+}
+
+/// `ribbon wait [--notes] [--timeout SECONDS]`: block until the person asks a question in
+/// ribbon (`?`), then print the open questions and exit. A Claude session runs it in the
+/// background, so a question wakes it with the context of the code it wrote. `--notes` also
+/// wakes on any open note from the person. Exits with 3 at the timeout.
+fn wait(args: &[String]) -> anyhow::Result<ExitCode> {
+    let (mut any_note, mut timeout) = (false, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--notes" => any_note = true,
+            "--questions" => {}
+            "--timeout" => timeout = Some(Duration::from_secs(rest.next().context("--timeout needs seconds")?.parse().context("--timeout needs seconds")?)),
+            other => anyhow::bail!("ribbon wait takes --notes and --timeout SECONDS, not {other:?}"),
+        }
+    }
+    let file = notes::notes_file(&git::top_level().unwrap_or_else(|_| PathBuf::from(".")));
+    let started = std::time::Instant::now();
+    loop {
+        let open: Vec<notes::Note> = notes::load(&file, true).unwrap_or_default().into_iter().filter(|n| n.is_open() && (any_note || n.is_question())).collect();
+        if !open.is_empty() {
+            for note in &open {
+                let (first, last) = note.range;
+                let lines = if first == last { format!("{first}") } else { format!("{first}-{last}") };
+                let side = if note.old_side { " (old side)" } else { "" };
+                let what = if note.is_question() { "question" } else { "note" };
+                println!("{what} {} on {}:{lines}{side}: {}", note.id.as_deref().unwrap_or("?"), note.path, note.summary);
+            }
+            println!("Answer in {}: set the reply and \"status\": \"done\", then run ribbon wait again.", file.display());
+            return Ok(ExitCode::SUCCESS);
+        }
+        if timeout.is_some_and(|t| started.elapsed() >= t) {
+            println!("no questions yet; run ribbon wait again to keep waiting");
+            return Ok(ExitCode::from(3));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// `ribbon send ...`: one request to a listening ribbon. Prints the reply as JSON.
@@ -802,7 +891,7 @@ fn write_note(top: &Path, request: &serde_json::Value) -> anyhow::Result<serde_j
     };
     let anchor = (!old_side).then(|| std::fs::read_to_string(top.join(&path)).ok()).flatten().and_then(|text| model::split_lines(&text).get(range.1 - 1).cloned());
     let id = notes::new_id();
-    let note = notes::Note { id: Some(id.clone()), path, old_side, range, anchor, summary, rationale, author: Some(author), status, reply: None, editable: true };
+    let note = notes::Note { id: Some(id.clone()), path, old_side, range, anchor, summary, rationale, author: Some(author), status, reply: None, kind: None, editable: true };
     notes::add(&notes::notes_file(top), &note)?;
     Ok(listen::ok(serde_json::json!({ "id": id, "written": "notes file (no ribbon listening)" })))
 }
@@ -812,6 +901,9 @@ fn run() -> anyhow::Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "send") {
         return send(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "wait") {
+        return wait(&args[1..]);
     }
     let Some(mut options) = parse_args()? else {
         return Ok(ExitCode::SUCCESS);
@@ -958,6 +1050,10 @@ fn run() -> anyhow::Result<ExitCode> {
         checks,
         pull_request: options.pull_request.clone(),
         moved: options.moved,
+        old_revision: old_revision(&options),
+        recent_days: options.recent_days,
+        coverage: coverage::find(options.coverage.as_deref(), &top),
+        top: top.clone(),
         agent_context: options.agent_context.clone(),
     };
     let mut files = file_diffs(diffs);

@@ -139,6 +139,46 @@ adds a note with `"author": "claude"`, like the notes in "Explain your own chang
 nothing listens, `navigate`, `highlight`, `clear`, `reload`, and `status` fail with "no ribbon
 listens": do not start ribbon yourself; it needs the person's terminal.
 
+## Answer questions about your code
+
+The person can select lines in ribbon, press `?`, and ask a question. It is saved as a note
+with `"kind": "question"`. You wrote the code, so you are the one to answer it.
+
+When you hand the person code to review in a repository with a `.ribbon` folder, start
+`ribbon wait` with `run_in_background`. It blocks until there is an open question, prints it,
+and exits; that wakes you. Then:
+
+1. Answer each question in its note: set `"reply"` to the answer and `"status"` to `"done"`, as
+   in "Act on the open notes". Answer from what you know about why you wrote the code. Do not
+   change code for a question unless it asks for a change.
+2. Start `ribbon wait` again, so the next question wakes you too.
+
+`ribbon wait` exits with 3 when its `--timeout` passes with no question; start it again if the
+person is still reviewing. `ribbon wait --notes` also wakes on any open note from the person.
+
+## Guided tour
+
+When the person asks for a tour or a walkthrough of a change, or after a change that touches
+many files, write `.ribbon/tour.json`: the stops in the order to read the change, each with one
+or two sentences. Start where the change starts (a new type, the entry point), then follow the
+calls. Keep it to the stops that matter, usually 3 to 10.
+
+```json
+{
+  "version": 1,
+  "title": "How uploads retry",
+  "stops": [
+    { "path": "src/retry.rs", "newRange": [1, 30], "text": "Start here: the retry policy, three tries with backoff." },
+    { "path": "src/upload.rs", "newRange": [40, 52], "text": "The upload calls the policy around the request." },
+    { "path": "src/upload.rs", "oldRange": [60, 75], "text": "The old loop that retried forever is gone." }
+  ]
+}
+```
+
+Ranges work as in notes (1-based, inclusive; `oldRange` for removed lines). In ribbon, `t` goes
+to the next stop and `T` back; the stop's text shows under its lines. Writing the file again
+starts a new tour.
+
 ## Notes from other tools
 
 `ribbon --agent-context FILE` shows a file in the same format (Hunk's agent-context format),
