@@ -18,6 +18,7 @@ mod imports;
 mod listen;
 mod model;
 mod moves;
+mod repeats;
 mod notes;
 mod patch;
 mod search;
@@ -101,6 +102,7 @@ KEYS:
     s                   split / unified layout   v        select lines: j/k extend, o other end,
                                                           J/K move the selection
     m                   on moved code (purple), select where it went or came from
+    r                   on a repeated edit (n skips its repeats), list every place it is made
     :42, :40-52, :o42   select lines of this file (o: old side); :PATH:42 another file
     click a line number select that line (drag or Shift-click for more), then as with v
     z, click a fold     show the hidden lines    Z        fold them again

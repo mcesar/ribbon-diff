@@ -177,6 +177,11 @@ struct FileState {
     /// For each line, the moved block it belongs to (an index into the app's moves).
     old_moved: Vec<Option<usize>>,
     new_moved: Vec<Option<usize>>,
+    /// For each block, its repeated edit and which place it is (0 for the first).
+    block_repeat: Vec<Option<(usize, usize)>>,
+    /// Lines of the repeats after the first, drawn dimmer: the edit was already read.
+    old_seen: Vec<bool>,
+    new_seen: Vec<bool>,
     old_tokens: Vec<Tokens>,
     new_tokens: Vec<Tokens>,
     added: usize,
@@ -203,11 +208,40 @@ impl FileState {
             removed: diff.model.blocks.iter().map(|b| b.a1 - b.a0).sum(),
             old_moved: vec![None; diff.model.old.len()],
             new_moved: vec![None; diff.model.new.len()],
+            block_repeat: vec![None; diff.model.blocks.len()],
+            old_seen: vec![false; diff.model.old.len()],
+            new_seen: vec![false; diff.model.new.len()],
             diff,
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
         }
     }
+}
+
+/// Find the edits made in more than one place, leaving out moved code, and mark their blocks.
+fn mark_repeats(files: &mut [FileState]) -> Vec<crate::repeats::Group> {
+    let moved = |file: &FileState, block: &Block| {
+        file.old_moved[block.a0..block.a1].iter().chain(&file.new_moved[block.b0..block.b1]).any(Option::is_some)
+    };
+    let groups = {
+        let models: Vec<&Model> = files.iter().map(|f| &f.diff.model).collect();
+        crate::repeats::find(&models, |file, block| moved(&files[file], &files[file].diff.model.blocks[block]))
+    };
+    for file in files.iter_mut() {
+        file.block_repeat.iter_mut().for_each(|r| *r = None);
+        file.old_seen.iter_mut().chain(file.new_seen.iter_mut()).for_each(|s| *s = false);
+    }
+    for (group, found) in groups.iter().enumerate() {
+        for (place, &(file, block)) in found.places.iter().enumerate() {
+            let state = &mut files[file];
+            state.block_repeat[block] = Some((group, place));
+            if place > 0 {
+                let b = state.diff.model.blocks[block];
+                state.old_seen[b.a0..b.a1].iter_mut().chain(state.new_seen[b.b0..b.b1].iter_mut()).for_each(|s| *s = true);
+            }
+        }
+    }
+    groups
 }
 
 /// Find the moved blocks in all files, and mark their lines.
@@ -647,6 +681,13 @@ impl Theme {
         }
     }
 
+    /// Tints for a repeat of an edit already read: half as strong.
+    fn seen_tints(&self, old_side: bool) -> Option<(Color, Color)> {
+        let base = self.tint_base?;
+        let color = self.side_rgb(old_side);
+        Some((rgb(mix(color, base, ROW_TINT / 2.0)), rgb(mix(color, base, WORD_TINT / 2.0))))
+    }
+
     fn moved_tint(&self) -> Option<Color> {
         Some(rgb(mix(MOVED, self.tint_base?, ROW_TINT)))
     }
@@ -757,8 +798,10 @@ fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool
                 let changed = kinds[index].is_some();
                 let moved = (if old_side { &file.old_moved } else { &file.new_moved })[index].is_some();
                 // Moved lines take one tint, with no word marks: their words did not change.
+                let seen = (if old_side { &file.old_seen } else { &file.new_seen })[index];
                 let tints = match (changed, moved) {
                     (true, true) => theme.moved_tint().map(|tint| (tint, tint)),
+                    (true, false) if seen => theme.seen_tints(old_side),
                     (true, false) => theme.tints(old_side),
                     _ => None,
                 };
@@ -847,7 +890,9 @@ fn draw_note_row(buf: &mut Buffer, area: Rect, code_x: u16, app: &App, index: us
     clear(buf, area, panel);
     // Open notes from the person are yellow, done ones green, and notes from agents magenta.
     // Findings from a code review that wait for a decision are cyan, dismissed ones grey.
-    let accent = if note.is_open() {
+    let accent = if index >= app.label_start {
+        theme.muted()
+    } else if note.is_open() {
         Color::Yellow
     } else if note.is_undecided() {
         Color::Cyan
@@ -1041,7 +1086,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
         side.to_owned()
     };
     let open = app.notes.iter().filter(|n| n.is_open()).count();
-    let file_part = match (open, app.notes.len()) {
+    let file_part = match (open, app.label_start) {
         (_, 0) => file_part,
         (0, all) => format!("{file_part} {all} notes  ·"),
         (open, _) => format!("{file_part} {open} open notes  ·"),
@@ -1100,6 +1145,10 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
             0 => String::new(),
             1 => "  ·  1 move (m)".to_owned(),
             n => format!("  ·  {n} moves (m)"),
+        } + &match app.repeats.len() {
+            0 => String::new(),
+            1 => "  ·  1 repeated edit (r)".to_owned(),
+            n => format!("  ·  {n} repeated edits (r)"),
         },
         if app.hscroll > 0 { format!("  ·  col {}", app.hscroll + 1) } else { String::new() },
     );
@@ -1107,11 +1156,39 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
 }
 
 /// A centered list of files; the selected one is highlighted.
+/// The places of one repeated edit; the selected one is highlighted.
+fn draw_repeat_list(buf: &mut Buffer, area: Rect, app: &App, group: usize, selected: usize) {
+    let found = &app.repeats[group];
+    let width = area.width.saturating_sub(8).min(110).max(20);
+    let height = (found.places.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let frame = match app.theme.rgb {
+        Some(_) => app.theme.panel(),
+        None => Style::default().bg(Color::Black).fg(Color::Reset),
+    };
+    clear(buf, Rect::new(x, y, width, height), frame);
+    let title = format!(" {} in {} places  (Enter go to, Esc close)", found.what, found.places.len());
+    buf.set_line(x, y, &Line::styled(title, frame.add_modifier(Modifier::BOLD)), width);
+    let rows = (height - 2) as usize;
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (row, (index, &(file, block))) in found.places.iter().enumerate().skip(first).take(rows).enumerate() {
+        let style = if index == selected { frame.add_modifier(Modifier::REVERSED) } else { frame };
+        let row_area = Rect::new(x, y + 1 + row as u16, width, 1);
+        clear(buf, row_area, style);
+        let diff = &app.files[file].diff;
+        let b = diff.model.blocks[block];
+        let (line, text) = if b.b1 > b.b0 { (b.b0 + 1, diff.model.new[b.b0].trim()) } else { (b.a0 + 1, diff.model.old[b.a0].trim()) };
+        let place = format!("{}:{line}", diff.new_name);
+        buf.set_line(x, row_area.y, &Line::styled(format!(" {place:<40} {text}"), style), width);
+    }
+}
+
 /// A centered list of every note; the selected one is highlighted.
 fn draw_note_list(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
     let theme = &app.theme;
     let width = area.width.saturating_sub(8).min(110).max(20);
-    let height = (app.notes.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
+    let height = (app.label_start as u16 + 2).min(area.height.saturating_sub(4)).max(3);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let frame = match theme.rgb {
@@ -1119,12 +1196,12 @@ fn draw_note_list(buf: &mut Buffer, area: Rect, app: &App, selected: usize) {
         None => Style::default().bg(Color::Black).fg(Color::Reset),
     };
     clear(buf, Rect::new(x, y, width, height), frame);
-    let title = format!(" {} notes  (Enter go to, x delete, F/D fix/dismiss a finding, Esc close)", app.notes.len());
+    let title = format!(" {} notes  (Enter go to, x delete, F/D fix/dismiss a finding, Esc close)", app.label_start);
     buf.set_line(x, y, &Line::styled(title, frame.add_modifier(Modifier::BOLD)), width);
     let rows = (height - 2) as usize;
     let first = selected.saturating_sub(rows.saturating_sub(1));
     let placed = app.note_rows();
-    for (row, (index, note)) in app.notes.iter().enumerate().skip(first).take(rows).enumerate() {
+    for (row, (index, note)) in app.notes[..app.label_start].iter().enumerate().skip(first).take(rows).enumerate() {
         let style = if index == selected { frame.add_modifier(Modifier::REVERSED) } else { frame };
         let row_area = Rect::new(x, y + 1 + row as u16, width, 1);
         clear(buf, row_area, style);
@@ -1262,6 +1339,12 @@ struct App {
     goto: Option<String>,
     /// Blocks of code moved from one place to another; empty with `moved = false`.
     moves: Vec<crate::moves::Move>,
+    /// Edits made in more than one place.
+    repeats: Vec<crate::repeats::Group>,
+    /// Notes before this index are real; the rest are labels ribbon adds (on repeated edits).
+    label_start: usize,
+    /// `r`: the places of one repeated edit, and the selected row.
+    repeat_list: Option<(usize, usize)>,
     find_moves: bool,
     /// The list of notes, with its selected row.
     note_list: Option<usize>,
@@ -1428,6 +1511,8 @@ impl App {
         if self.find_moves {
             self.moves = mark_moves(&mut self.files);
         }
+        self.repeats = mark_repeats(&mut self.files);
+        self.add_labels();
         self.stream = self.build_stream(wrap);
         self.generation += 1;
         self.selection = None;
@@ -1776,7 +1861,88 @@ impl App {
             }
         }
         self.notes = loaded;
-        self.picked_note = self.picked_note.filter(|&n| n < self.notes.len());
+        self.label_start = self.notes.len();
+        self.add_labels();
+        self.picked_note = self.picked_note.filter(|&n| n < self.label_start);
+    }
+
+    /// A label under the first place of each repeated edit, kept after the real notes.
+    fn add_labels(&mut self) {
+        self.notes.truncate(self.label_start.min(self.notes.len()));
+        self.label_start = self.notes.len();
+        for group in &self.repeats {
+            let Some(&(file, block)) = group.places.first() else { continue };
+            let diff = &self.files[file].diff;
+            let b = diff.model.blocks[block];
+            let (old_side, path, line) = if b.b1 > b.b0 { (false, &diff.new_name, b.b1) } else { (true, &diff.old_name, b.a1) };
+            let others = group.places.len() - 1;
+            self.notes.push(Note {
+                id: None,
+                path: path.clone(),
+                old_side,
+                range: (line, line),
+                anchor: None,
+                summary: format!("{}. The {others} other place{} show dimmer; n skips them, r lists them.", group.what, if others == 1 { "" } else { "s" }),
+                rationale: None,
+                author: Some(format!("same edit in {} places", group.places.len())),
+                status: None,
+                reply: None,
+                editable: false,
+            });
+        }
+    }
+
+    /// The index of a block in the whole stream, as n/N count changes.
+    fn change_index(&self, file: usize, block: usize) -> usize {
+        self.files[..file].iter().map(|f| f.diff.model.blocks.len()).sum::<usize>() + block
+    }
+
+    /// The file and block of a change in the whole stream.
+    fn change_at(&self, mut index: usize) -> Option<(usize, usize)> {
+        for (file, state) in self.files.iter().enumerate() {
+            if index < state.diff.model.blocks.len() {
+                return Some((file, index));
+            }
+            index -= state.diff.model.blocks.len();
+        }
+        None
+    }
+
+    /// True for a change that repeats an edit seen earlier: n and N skip it.
+    fn is_seen_repeat(&self, index: usize) -> bool {
+        self.change_at(index).and_then(|(file, block)| self.files[file].block_repeat[block]).is_some_and(|(_, place)| place > 0)
+    }
+
+    /// `r`: list the places of the repeated edit at the current change.
+    fn open_repeat_list(&mut self) {
+        let here = self.current_change().checked_sub(1).and_then(|i| self.change_at(i)).and_then(|(file, block)| self.files[file].block_repeat[block]);
+        match here {
+            Some((group, place)) => self.repeat_list = Some((group, place)),
+            None if self.repeats.is_empty() => self.notice = Some("no edit is repeated in this diff".into()),
+            None => self.notice = Some(format!("this change is not repeated; {} edits are (n goes to them)", self.repeats.len())),
+        }
+    }
+
+    fn apply_repeat_list(&mut self, key: &KeyEvent, group: usize, selected: usize) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let last = self.repeats[group].places.len().saturating_sub(1);
+        self.repeat_list = match key.code {
+            KeyCode::Esc | KeyCode::Char('r') | KeyCode::Char('q') => None,
+            KeyCode::Enter => {
+                let (file, block) = self.repeats[group].places[selected];
+                let index = self.change_index(file, block);
+                if let Some(&start) = self.stream.change_starts(self.scroll_off).get(index) {
+                    self.position = start;
+                    self.picked_change = Some(index);
+                }
+                None
+            }
+            KeyCode::Char('j') | KeyCode::Down => Some((group, (selected + 1).min(last))),
+            KeyCode::Char('k') | KeyCode::Up => Some((group, selected.saturating_sub(1))),
+            _ => Some((group, selected)),
+        };
     }
 
     /// Read the notes again when a notes file changed. Returns true when it did.
@@ -1816,7 +1982,7 @@ impl App {
 
     /// `}` and `{`: the next or previous note in the stream.
     fn step_note(&mut self, forward: bool) {
-        let mut order: Vec<(usize, usize)> = (0..self.notes.len())
+        let mut order: Vec<(usize, usize)> = (0..self.label_start)
             .filter_map(|n| self.note_row(n).map(|(old_side, row)| (self.stream.scroll.position_of_row(row, old_side), n)))
             .collect();
         order.sort();
@@ -2397,7 +2563,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        let last = self.notes.len().saturating_sub(1);
+        let last = self.label_start.saturating_sub(1);
         self.note_list = match key.code {
             KeyCode::Esc | KeyCode::Char('A') | KeyCode::Char('q') => None,
             KeyCode::Enter => {
@@ -2406,7 +2572,7 @@ impl App {
             }
             KeyCode::Char('x') => {
                 self.delete_note(selected);
-                (!self.notes.is_empty()).then(|| selected.min(self.notes.len() - 1))
+                (self.label_start > 0).then(|| selected.min(self.label_start - 1))
             }
             KeyCode::Char(key @ ('F' | 'D')) => {
                 self.decide(selected, if key == 'F' { "open" } else { "dismissed" }, false);
@@ -2668,6 +2834,10 @@ impl App {
                 return None;
             }
         }
+        if let (Some((group, selected)), Event::Key(key)) = (self.repeat_list, event) {
+            self.apply_repeat_list(key, group, selected);
+            return None;
+        }
         if let (Some(selected), Event::Key(key)) = (self.note_list, event) {
             self.apply_note_list(key, selected);
             return None;
@@ -2777,6 +2947,10 @@ impl App {
                         self.start_visual();
                         self.position
                     }
+                    KeyCode::Char('r') => {
+                        self.open_repeat_list();
+                        self.position
+                    }
                     KeyCode::Char('m') => {
                         self.jump_to_other_end();
                         self.position
@@ -2812,7 +2986,7 @@ impl App {
                         self.position
                     }
                     KeyCode::Char('A') => {
-                        if self.notes.is_empty() {
+                        if self.label_start == 0 {
                             self.notice = Some("no notes (a adds one)".into());
                         } else {
                             self.note_list = Some(self.picked_note.unwrap_or(0));
@@ -2877,11 +3051,21 @@ impl App {
                     // the scroll position.
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('p') => {
                         let picked = self.picked_change.filter(|&i| self.change_on_screen(i));
-                        let index = if key.code == KeyCode::Char('n') {
+                        let forward = key.code == KeyCode::Char('n');
+                        let mut index = if forward {
                             picked.map_or_else(|| starts.iter().position(|&s| s > position), |i| Some(i + 1)).filter(|&i| i < starts.len())
                         } else {
                             picked.map_or_else(|| starts.iter().rposition(|&s| s < position), |i| i.checked_sub(1))
                         };
+                        // Repeats of an edit already read are skipped.
+                        let mut skipped = 0;
+                        while let Some(i) = index.filter(|&i| self.is_seen_repeat(i)) {
+                            skipped += 1;
+                            index = if forward { Some(i + 1).filter(|&i| i < starts.len()) } else { i.checked_sub(1) };
+                        }
+                        if skipped > 0 {
+                            self.notice = Some(format!("skipped {skipped} repeat{} of an edit already shown (r lists them)", if skipped == 1 { "" } else { "s" }));
+                        }
                         match index {
                             Some(index) => {
                                 self.picked_change = Some(index);
@@ -3386,6 +3570,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut files: Vec<FileState> = diffs.into_iter().map(FileState::new).collect();
     let moves = if settings.moved { mark_moves(&mut files) } else { Vec::new() };
+    let repeats = mark_repeats(&mut files);
     let stream = Stream::new(&files, Some(settings.context), &HashSet::new(), None, &[], false);
     let mut highlights = spawn_highlighting(&files, &settings.highlighter);
     let (max_width, number_width) = measure(&files);
@@ -3433,6 +3618,9 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         editor_columns: 40,
         goto: None,
         moves,
+        repeats,
+        label_start: 0,
+        repeat_list: None,
         find_moves: settings.moved,
         note_list: None,
         mark: None,
@@ -3502,6 +3690,9 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
             if let Some(selected) = app.note_list {
                 draw_note_list(buf, area, &app, selected);
             }
+            if let Some((group, selected)) = app.repeat_list {
+                draw_repeat_list(buf, area, &app, group, selected);
+            }
             if let Some(selected) = app.picker {
                 draw_picker(buf, area, &app, selected);
             }
@@ -3512,7 +3703,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
 
         if graphics == Graphics::Kitty {
             // The lists cover the ribbon column, so the image comes down while one is open.
-            let wanted = (app.picker.is_none() && app.note_list.is_none() && app.note_draft.is_none()).then_some((app.whole_file, app.generation, view));
+            let wanted = (app.picker.is_none() && app.note_list.is_none() && app.note_draft.is_none() && app.repeat_list.is_none()).then_some((app.whole_file, app.generation, view));
             if wanted != last_image {
                 let backend = term.backend_mut();
                 match wanted {
