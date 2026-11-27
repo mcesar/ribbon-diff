@@ -93,7 +93,9 @@ KEYS:
     n/N                 next/prev change         ]/[      next/prev file
     f, Tab              file list (type to filter, arrows move, Enter opens)
     c                   whole file / changes only
-    s                   split / unified layout   v        select lines (j/k extend)
+    s                   split / unified layout   v        select lines: j/k extend, o other end,
+                                                          J/K move the selection
+    click a line number select that line (drag or Shift-click for more), then as with v
     z, click a fold     show the hidden lines    Z        fold them again
     w                   wrap long lines
     g/G                 top/end                  q        quit

@@ -92,7 +92,8 @@ When stdout is not a terminal (a pipe, a pager), ribbon prints a plain unified d
 | `Z` | close every opened fold (`c` twice does too) |
 | `w` | wrap long lines / scroll them sideways |
 | `s` | split / unified layout (unified: removed lines above the lines that replace them, in one column) |
-| `v` | select whole lines with the keyboard: `j`/`k` extend, then `y` copy, `a` note, `Y` change, `e` edit, `Esc` cancel |
+| `v` | select whole lines with the keyboard: `j`/`k` extend, `o` goes to the other end, `J`/`K` move the whole selection one line; then `y` copy, `a` note, `Y` change, `e` edit, `Esc` cancel |
+| click a line number | select that line; drag on the numbers or Shift-click another number for more lines. The keys of `v` work on it, so `a` adds a note on exactly those lines |
 | `e` | open `$VISUAL` or `$EDITOR` at the line: the start of the selection, or else the first changed line on screen; the view reloads after the editor closes |
 | `<` / `>` | old side alone / new side alone, full width; the same key again shows both |
 | `g` / `G` | top / end |

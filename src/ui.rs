@@ -1002,7 +1002,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, file: usize) {
             format!(" post {} notes as a review on PR #{} ({})?   y post  any other key cancels", notes.len(), pr.number, pr.repo)
         }),
         _ if app.visual && app.notice.is_none() => {
-            Some(" VISUAL  j/k extend  y copy  a note  Y change  e edit  Esc cancel".to_owned())
+            Some(" VISUAL  j/k extend  o other end  J/K move  y copy  a note  Y change  e edit  Esc cancel".to_owned())
         }
         _ if app.copy_menu => Some(" copy:  p path  a absolute path  f file name  l path:line  c change   Esc cancel".to_owned()),
         _ if app.note_draft.is_some() => app.note_draft.as_ref().map(|d| {
@@ -1143,6 +1143,8 @@ struct App {
     selection: Option<Selection>,
     /// True while the mouse button that started the selection is down.
     dragging: bool,
+    /// The selection was made on the line numbers: whole lines, which the keys of `v` change.
+    gutter: bool,
     /// A short message that replaces the key help until the next key.
     notice: Option<String>,
     search: Option<Search>,
@@ -2068,33 +2070,55 @@ impl App {
         });
     }
 
-    /// j/k (and arrows) move the end of a keyboard selection by one line; the view follows it.
+    /// The first row of the next or previous line on a side (wrapped rows and notes are
+    /// skipped).
+    fn next_line_row(&self, old_side: bool, row: usize, forward: bool) -> Option<usize> {
+        let starts_line = |row: usize| self.line_of(old_side, row).is_some_and(|(_, _, _, part)| part == 0);
+        if forward { (row + 1..self.rows(old_side).len()).find(|&r| starts_line(r)) } else { (0..row).rev().find(|&r| starts_line(r)) }
+    }
+
+    /// Scroll so a row of the selection has `scroll_off` rows around it.
+    fn follow_row(&mut self, old_side: bool, row: usize) {
+        let (left_top, right_top) = self.stream.scroll.tops(self.position);
+        let top = if old_side { left_top } else { right_top };
+        let off = self.scroll_off.min(self.body_rows.saturating_sub(1) / 2);
+        if row < top + off {
+            self.position = self.stream.scroll.position_of_row(row.saturating_sub(off), old_side);
+        } else if row + off + 1 > top + self.body_rows {
+            self.position = self.stream.scroll.position_of_row((row + off + 1).saturating_sub(self.body_rows), old_side);
+        }
+    }
+
+    /// Keys of a keyboard selection: j/k (and arrows) move its end by one line, o swaps its
+    /// two ends, J/K move the whole selection by one line. The view follows the end.
     /// Returns false for keys that are not about the selection.
     fn apply_visual_key(&mut self, key: &KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return true;
         }
-        let forward = match key.code {
-            KeyCode::Char('j') | KeyCode::Down => true,
-            KeyCode::Char('k') | KeyCode::Up => false,
-            _ => return false,
-        };
         let (old_side, anchor) = self.visual_anchor;
         let head = self.selection.map_or(anchor, |s| s.head.0);
-        let rows = self.rows(old_side).len();
-        // The first row of the next or previous line (wrapped rows and notes are skipped).
-        let starts_line = |row: usize| self.line_of(old_side, row).is_some_and(|(_, _, _, part)| part == 0);
-        let next = if forward { (head + 1..rows).find(|&r| starts_line(r)) } else { (0..head).rev().find(|&r| starts_line(r)) };
-        let Some(next) = next else { return true };
-        self.set_visual_head(next);
-        // Keep `scroll_off` rows around the end of the selection.
-        let (left_top, right_top) = self.stream.scroll.tops(self.position);
-        let top = if old_side { left_top } else { right_top };
-        let off = self.scroll_off.min(self.body_rows.saturating_sub(1) / 2);
-        if next < top + off {
-            self.position = self.stream.scroll.position_of_row(next.saturating_sub(off), old_side);
-        } else if next + off + 1 > top + self.body_rows {
-            self.position = self.stream.scroll.position_of_row((next + off + 1).saturating_sub(self.body_rows), old_side);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                let forward = matches!(key.code, KeyCode::Char('j') | KeyCode::Down);
+                let Some(next) = self.next_line_row(old_side, head, forward) else { return true };
+                self.set_visual_head(next);
+                self.follow_row(old_side, next);
+            }
+            KeyCode::Char('o') => {
+                self.visual_anchor = (old_side, head);
+                self.set_visual_head(anchor);
+                self.follow_row(old_side, anchor);
+            }
+            KeyCode::Char('J') | KeyCode::Char('K') => {
+                let forward = key.code == KeyCode::Char('J');
+                let moved = self.next_line_row(old_side, anchor, forward).zip(self.next_line_row(old_side, head, forward));
+                let Some((anchor, head)) = moved else { return true };
+                self.visual_anchor = (old_side, anchor);
+                self.set_visual_head(head);
+                self.follow_row(old_side, head);
+            }
+            _ => return false,
         }
         true
     }
@@ -2273,7 +2297,8 @@ impl App {
         let event = &remapped;
         if let Event::Mouse(mouse) = event {
             if self.select(mouse) {
-                self.visual = false;
+                // Lines picked on the line numbers act like `v`: j/k, o, and J/K go on from them.
+                self.visual = self.gutter && self.selection.is_some();
                 return None;
             }
         }
@@ -2626,6 +2651,13 @@ impl App {
         (at, column + skip)
     }
 
+    /// True when column `x` of a side is on its line numbers, not its code.
+    fn on_line_number(&self, old_side: bool, x: u16) -> bool {
+        let area = if old_side { self.sides.0 } else { self.sides.1 };
+        let (code_x, code_width) = code_area(area, self.number_width, self.numbers_right(old_side));
+        x < code_x || x >= code_x + code_width
+    }
+
     /// Start, extend, or finish a selection with the left button. Returns true when the event
     /// was used.
     fn select(&mut self, mouse: &MouseEvent) -> bool {
@@ -2634,6 +2666,22 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let side = if inside(self.sides.0) { Some(true) } else if inside(self.sides.1) { Some(false) } else { None };
+                // A click on a line number picks that whole line; Shift extends the lines picked
+                // before, and a drag on the numbers picks more.
+                if let Some(old_side) = side.filter(|&old_side| self.on_line_number(old_side, x)) {
+                    let (row, _) = self.cell_at(old_side, x, y);
+                    if self.line_of(old_side, row).is_some() {
+                        let extend = mouse.modifiers.contains(KeyModifiers::SHIFT) && self.gutter && self.selection.is_some_and(|s| s.old_side == old_side);
+                        if !extend {
+                            self.visual_anchor = (old_side, row);
+                        }
+                        self.set_visual_head(row);
+                        self.gutter = true;
+                        self.dragging = true;
+                        return true;
+                    }
+                }
+                self.gutter = false;
                 self.selection = side.map(|old_side| {
                     let cell = self.cell_at(old_side, x, y);
                     Selection { old_side, anchor: cell, head: cell }
@@ -2651,11 +2699,20 @@ impl App {
                     self.position += 1;
                 }
                 let head = self.cell_at(selection.old_side, x, y);
-                self.selection = Some(Selection { head, ..selection });
+                if self.gutter {
+                    if self.line_of(selection.old_side, head.0).is_some() {
+                        self.set_visual_head(head.0);
+                    }
+                } else {
+                    self.selection = Some(Selection { head, ..selection });
+                }
                 true
             }
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
+                if self.gutter {
+                    return true;
+                }
                 match self.selection {
                     // A click on a fold opens it.
                     Some(s) if s.anchor == s.head && matches!(self.rows(s.old_side).get(s.anchor.0), Some(Row::Fold(..))) => {
@@ -2881,6 +2938,7 @@ fn event_loop(diffs: Vec<FileDiff>, settings: Settings, graphics: Graphics, term
         sides: (Rect::default(), Rect::default()),
         selection: None,
         dragging: false,
+        gutter: false,
         notice: settings.notice.clone(),
         search: None,
         body_rows: 0,
