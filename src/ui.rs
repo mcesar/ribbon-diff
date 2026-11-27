@@ -655,6 +655,11 @@ fn paint_columns(buf: &mut Buffer, (code_x, code_width): (u16, u16), y: u16, hsc
 /// Line numbers sit next to the ribbon column: at the right edge of the old side, the left edge of the
 /// new. A side alone has them on the left.
 fn draw_side(buf: &mut Buffer, area: Rect, top: usize, app: &App, old_side: bool) {
+    // A side that is not on screen. In the unified layout its rows hold new lines, which
+    // the old side's data can't index.
+    if area.width == 0 {
+        return;
+    }
     let theme = &app.theme;
     let rows = if old_side { &app.stream.left } else { &app.stream.right };
     let number_width = app.number_width;
